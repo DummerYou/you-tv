@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>you-tv 远程配置</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0d1117;--card:#161b22;--line:#30363d;--text:#f0f3f6;--muted:#8b949e;--accent:#35c9b0;--danger:#ff7b72}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Microsoft YaHei",sans-serif}
+    main{width:min(760px,100%);margin:auto;padding:18px 14px 60px} header{display:flex;align-items:end;justify-content:space-between;margin-bottom:14px}
+    h1{font-size:22px;margin:0} h2{font-size:15px;margin:0 0 12px}.meta{font-size:12px;color:var(--muted)}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+    .tabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:#0d1117;padding:4px;border-radius:9px;margin-bottom:12px}
+    .tab{border:0;background:transparent;color:var(--muted);padding:8px;border-radius:7px;cursor:pointer}.tab.active{background:#26313a;color:var(--accent);font-weight:600}
+    .pane{display:none}.pane.active{display:block}.row{display:flex;gap:8px}.row>*:first-child{flex:1}
+    input,textarea,button{font:inherit;border-radius:7px;border:1px solid var(--line)}input,textarea{width:100%;background:#0d1117;color:var(--text);padding:9px 10px;outline:0}
+    input:focus,textarea:focus{border-color:var(--accent)}textarea{min-height:150px;resize:vertical}button{background:#26313a;color:var(--text);padding:8px 13px;cursor:pointer;white-space:nowrap}
+    button.primary{background:var(--accent);border-color:var(--accent);color:#07120f;font-weight:700}.hint{font-size:12px;color:var(--muted);margin:7px 0 0}
+    .field{margin-top:10px}.field label{display:block;color:var(--muted);font-size:12px;margin-bottom:4px}.switches{display:grid;grid-template-columns:repeat(2,1fr);gap:5px 18px}
+    .switch{display:flex;align-items:center;justify-content:space-between;padding:7px 2px;border-bottom:1px solid #222933}.switch input{width:18px;height:18px;accent-color:var(--accent)}
+    .status{display:flex;gap:8px;flex-wrap:wrap}.badge{padding:3px 8px;border-radius:999px;background:#26313a;font-size:12px}.badge.on{color:var(--accent)}
+    #toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:#e6edf3;color:#111;padding:8px 14px;border-radius:7px;opacity:0;transition:.2s;pointer-events:none}#toast.show{opacity:1;transform:translate(-50%,0)}
+    @media(max-width:520px){.switches{grid-template-columns:1fr}.row{flex-direction:column}.row button{width:100%}main{padding-top:12px}}
+  </style>
+</head>
+<body><main>
+  <header><div><h1>you-tv</h1><div class="meta">局域网远程配置</div></div><div id="modeBadge" class="badge on">读取中</div></header>
+  <section class="card">
+    <h2>频道源</h2>
+    <div class="status"><span id="updateTime" class="badge">更新时间：未提供</span><span class="badge">地址与文本只启用一个</span></div>
+    <div class="tabs"><button id="urlTab" class="tab">地址源</button><button id="textTab" class="tab">文本源 / 文件</button></div>
+    <div id="urlPane" class="pane">
+      <div class="row"><input id="uri" type="url" placeholder="https://example.com/channels.txt"><button id="saveUri" class="primary">启用并更新</button></div>
+      <p class="hint">地址源启用后，每次打开应用都会自动下载；下载失败会继续保留上次频道。</p>
+    </div>
+    <div id="textPane" class="pane">
+      <textarea id="playlist" spellcheck="false" placeholder="分组名,#genre#&#10;频道名,http://地址"></textarea>
+      <div class="row field"><input id="file" type="file" accept=".txt,.m3u,.m3u8,.json,text/plain"><button id="saveText" class="primary">启用文本源</button></div>
+      <p class="hint">选择文件会先读入文本框，点击启用后保存。文本源不会在启动时联网更新。</p>
+    </div>
+  </section>
+  <section class="card">
+    <h2>播放与数据</h2>
+    <div class="field"><label for="channel">默认频道号（0 为记忆上次频道）</label><div class="row"><input id="channel" type="number" min="0"><button id="saveChannel">保存</button></div></div>
+    <div class="field"><label for="epg">EPG 地址（多个地址用逗号分隔）</label><div class="row"><input id="epg"><button id="saveEpg">保存</button></div></div>
+    <div class="field"><label for="proxy">代理地址</label><div class="row"><input id="proxy" placeholder="http://host:port"><button id="saveProxy">保存</button></div></div>
+  </section>
+  <section class="card">
+    <h2>原版设置</h2><div id="switches" class="switches"></div>
+  </section>
+  <p class="hint">此页面无需账号，仅建议在可信局域网中使用。离开应用设置页或 10 分钟后服务会关闭。</p>
+</main><div id="toast"></div>
+<script>
+const $=s=>document.querySelector(s), prefLabels={channelReversal:'换台方向反转',channelNumber:'数字键选台',showTime:'显示时间',displaySeconds:'时间显示秒数',repeatInfo:'重复显示频道信息',defaultFavorite:'默认进入收藏',showAllChannels:'显示全部频道',compactMenu:'紧凑频道菜单',softDecode:'软解优先（重启生效）',bootStartup:'开机自动启动'};
+let settings={};
+function toast(message,error=false){const e=$('#toast');e.textContent=message;e.style.background=error?'var(--danger)':'#e6edf3';e.classList.add('show');setTimeout(()=>e.classList.remove('show'),2600)}
+async function request(url,body){const options=body===undefined?{}:{method:'POST',headers:{'Content-Type':typeof body==='string'?'text/plain':'application/json'},body:typeof body==='string'?body:JSON.stringify(body)};const response=await fetch(url,options);if(!response.ok)throw new Error(await response.text());return response.headers.get('content-type')?.includes('json')?response.json():response.text()}
+function showMode(mode){const url=mode==='url';$('#urlTab').classList.toggle('active',url);$('#textTab').classList.toggle('active',!url);$('#urlPane').classList.toggle('active',url);$('#textPane').classList.toggle('active',!url);$('#modeBadge').textContent=url?'当前：地址源':'当前：文本源'}
+function buildSwitches(){const root=$('#switches');root.innerHTML='';Object.entries(prefLabels).forEach(([key,label])=>{const row=document.createElement('label');row.className='switch';row.innerHTML=`<span>${label}</span><input type="checkbox" ${settings[key]?'checked':''}>`;row.querySelector('input').onchange=async e=>{try{await request('/api/v1/preference',{key,value:e.target.checked});settings[key]=e.target.checked;toast('已保存')}catch(x){e.target.checked=!e.target.checked;toast('保存失败',true)}};root.appendChild(row)})}
+async function decodePlaylistFile(file){const buffer=await file.arrayBuffer();try{return new TextDecoder('utf-8',{fatal:true}).decode(buffer)}catch(e){try{return new TextDecoder('gb18030').decode(buffer)}catch(x){return new TextDecoder('utf-8').decode(buffer)}}}
+async function load(){try{settings=await request('/api/settings');$('#uri').value=settings.channelUri||'';$('#playlist').value=settings.channelText||'';$('#channel').value=settings.channelDefault||0;$('#epg').value=settings.epg||'';$('#proxy').value=settings.proxy||'';$('#updateTime').textContent='更新时间：'+(settings.playlistUpdatedAt||'未提供');showMode(settings.sourceMode||'text');buildSwitches()}catch(e){toast('读取配置失败',true)}}
+$('#urlTab').onclick=()=>showMode('url');$('#textTab').onclick=()=>showMode('text');
+$('#file').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{$('#playlist').value=await decodePlaylistFile(file);toast('文件已读入')}catch(x){toast('文件读取失败',true)}};
+$('#saveUri').onclick=async()=>{const uri=$('#uri').value.trim();if(!/^https?:\/\//i.test(uri))return toast('请输入 http 或 https 地址',true);try{await request('/api/import-uri',{uri});showMode('url');toast('已启用地址源，正在更新')}catch(e){toast('地址源保存失败',true)}};
+$('#saveText').onclick=async()=>{const value=$('#playlist').value.trim();if(!value)return toast('文本不能为空',true);try{await request('/api/import-text',value);showMode('text');toast('已启用文本源')}catch(e){toast('文本源保存失败',true)}};
+$('#saveChannel').onclick=()=>request('/api/default-channel',{channel:Number($('#channel').value||0)}).then(()=>toast('已保存')).catch(()=>toast('保存失败',true));
+$('#saveEpg').onclick=()=>request('/api/epg',{epg:$('#epg').value.trim()}).then(()=>toast('已保存')).catch(()=>toast('保存失败',true));
+$('#saveProxy').onclick=()=>request('/api/proxy',{proxy:$('#proxy').value.trim()}).then(()=>toast('已保存')).catch(()=>toast('保存失败',true));
+load();
+</script></body></html>
