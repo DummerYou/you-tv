@@ -54,6 +54,11 @@ data class Program(
     val endTime: Int,
 )
 
+data class EpgGuide(
+    val programs: Map<String, List<Program>> = emptyMap(),
+    val logos: Map<String, String> = emptyMap(),
+)
+
 object SourceAddressClassifier {
     private val ipv4 = Regex("^(?:\\d{1,3}\\.){3}\\d{1,3}$")
 

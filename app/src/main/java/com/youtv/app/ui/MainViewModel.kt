@@ -10,7 +10,9 @@ import com.youtv.app.data.repository.AppSettings
 import com.youtv.app.data.repository.PlaylistSourceMode
 import com.youtv.app.domain.model.Channel
 import com.youtv.app.domain.model.ChannelGroup
+import com.youtv.app.domain.model.EpgGuide
 import com.youtv.app.domain.model.Program
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -25,6 +27,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import com.youtv.app.requests.HttpClient
 import okhttp3.Request
+import kotlin.coroutines.coroutineContext
 
 enum class Overlay { NONE, CHANNELS, PROGRAM, SETTINGS }
 
@@ -60,6 +63,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val loading = MutableStateFlow(true)
     private val message = MutableStateFlow<String?>(null)
     private var infoHideJob: Job? = null
+    private var playlistJob: Job? = null
 
     private val chrome = combine(overlay, infoVisible) { activeOverlay, showInfo ->
         activeOverlay to showInfo
@@ -68,8 +72,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val data = combine(
         repository.observeGroups(),
         container.settingsRepository.settings,
-        container.epgRepository.programs,
-    ) { groups, settings, programs -> Triple(groups, settings, programs) }
+        container.epgRepository.guide,
+    ) { groups, settings, guide -> Triple(groups.withEpgLogos(guide), settings, guide) }
 
     val state: StateFlow<MainUiState> = combine(
         data,
@@ -77,12 +81,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         currentIndex,
         loading,
         message,
-    ) { (groups, settings, programs), (activeOverlay, showInfo), index, isLoading, currentMessage ->
+    ) { (groups, settings, guide), (activeOverlay, showInfo), index, isLoading, currentMessage ->
         val allChannels = groups.flatMap { it.channels }
         val safeIndex = index.coerceIn(0, (allChannels.size - 1).coerceAtLeast(0))
         val channelPrograms = allChannels.getOrNull(safeIndex)?.let { channel ->
             val name = channel.name.ifEmpty { channel.title }.lowercase()
-            programs.entries.firstOrNull { (key, _) -> name.contains(key.lowercase()) }?.value
+            guide.programs.entries.firstOrNull { (key, _) -> name.contains(key.lowercase()) }?.value
         }.orEmpty()
         MainUiState(
             groups, allChannels, safeIndex, activeOverlay, settings, isLoading,
@@ -91,7 +95,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), MainUiState())
 
     init {
-        viewModelScope.launch { initializeChannels() }
+        launchPlaylistTask(showGenericError = false) { initializeChannels() }
         viewModelScope.launch {
             container.epgRepository.loadCache()
             val epg = container.settingsRepository.settings.first().epgUrl
@@ -232,7 +236,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun importFromUrl(url: String) {
-        viewModelScope.launch {
+        launchPlaylistTask {
             updateFromUrl(url, showResult = true)
         }
     }
@@ -243,14 +247,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun useTextSource() {
-        viewModelScope.launch {
+        launchPlaylistTask {
             val file = File(getApplication<Application>().filesDir, TEXT_PLAYLIST_FILE)
             if (!file.exists() || file.length() == 0L) {
                 message.value = "还没有保存的文本源，请先导入文件或文本"
-                return@launch
+                return@launchPlaylistTask
             }
-            loading.value = true
-            val content = withContext(Dispatchers.IO) { file.readText() }
+            val content = withContext(Dispatchers.IO) { file.readPlaylistText() }
             val report = withContext(Dispatchers.IO) { repository.importPlaylist(content) }
             if (report.isSuccess) {
                 container.settingsRepository.setSourceMode(PlaylistSourceMode.TEXT)
@@ -259,13 +262,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 message.value = report.issues.firstOrNull()?.message ?: "文本源解析失败"
             }
-            loading.value = false
         }
     }
 
     fun importPlaylist(content: String) {
-        viewModelScope.launch {
-            loading.value = true
+        launchPlaylistTask {
             val report = withContext(Dispatchers.IO) { repository.importPlaylist(content) }
             if (report.isSuccess) withContext(Dispatchers.IO) {
                 File(getApplication<Application>().filesDir, TEXT_PLAYLIST_FILE).writeText(content)
@@ -278,7 +279,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             message.value = if (report.isSuccess) {
                 "已导入 ${report.imported} 个频道，合并 ${report.mergedSources} 个来源"
             } else report.issues.firstOrNull()?.message ?: "导入失败"
-            loading.value = false
         }
     }
 
@@ -287,13 +287,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val settings = container.settingsRepository.settings.first()
         if (settings.sourceMode == PlaylistSourceMode.URL && settings.configUrl.isNotBlank()) {
             updateFromUrl(settings.configUrl, showResult = false)
-        } else {
-            loading.value = false
         }
     }
 
     private suspend fun updateFromUrl(url: String, showResult: Boolean) {
-        loading.value = true
         val content = withContext(Dispatchers.IO) {
             runCatching {
                 HttpClient.getClientWithProxy().newCall(Request.Builder().url(url).build()).execute().use { response ->
@@ -303,7 +300,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (content.isNullOrBlank()) {
             if (showResult) message.value = "订阅下载失败，继续使用上次频道"
-            loading.value = false
             return
         }
         val report = withContext(Dispatchers.IO) { repository.importPlaylist(content) }
@@ -319,7 +315,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } else if (showResult) {
             message.value = report.issues.firstOrNull()?.message ?: "订阅解析失败"
         }
-        loading.value = false
     }
 
     private suspend fun saveMetadata(value: String?) {
@@ -333,8 +328,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val context = getApplication<Application>()
         val legacyFile = File(context.filesDir, ACTIVE_PLAYLIST_FILE)
         val content = withContext(Dispatchers.IO) {
-            if (legacyFile.exists() && legacyFile.length() > 0) legacyFile.readText()
-            else context.resources.openRawResource(R.raw.channels).bufferedReader().use { it.readText() }
+            if (legacyFile.exists() && legacyFile.length() > 0) {
+                legacyFile.readPlaylistText()
+            } else {
+                context.resources.openRawResource(R.raw.channels).use { input ->
+                    PlaylistTextDecoder.decode(input.readBytes())
+                }
+            }
         }
         val report = repository.importPlaylist(content, migrateLegacyFavorites = true)
         if (report.isSuccess) {
@@ -343,6 +343,51 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             saveMetadata(report.updatedAt)
         }
         message.value = if (!report.isSuccess) "旧频道数据迁移失败，已保留原文件" else null
+    }
+
+    private fun launchPlaylistTask(
+        showGenericError: Boolean = true,
+        block: suspend () -> Unit,
+    ) {
+        playlistJob?.cancel()
+        val job = viewModelScope.launch {
+            loading.value = true
+            try {
+                block()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (showGenericError) {
+                    message.value = error.message?.takeIf(String::isNotBlank)
+                        ?.let { "操作失败：$it" }
+                        ?: "操作失败"
+                }
+            } finally {
+                if (playlistJob === coroutineContext[Job]) {
+                    loading.value = false
+                    playlistJob = null
+                }
+            }
+        }
+        playlistJob = job
+    }
+
+    private fun File.readPlaylistText(): String = PlaylistTextDecoder.decode(readBytes())
+
+    private fun List<ChannelGroup>.withEpgLogos(guide: EpgGuide): List<ChannelGroup> =
+        map { group ->
+            group.copy(channels = group.channels.map { channel ->
+                if (channel.logo.isNotBlank()) {
+                    channel
+                } else {
+                    channel.copy(logo = guide.logoFor(channel.name.ifEmpty { channel.title }))
+                }
+            })
+        }
+
+    private fun EpgGuide.logoFor(channelName: String): String {
+        val name = channelName.lowercase()
+        return logos.entries.firstOrNull { (key, _) -> name.contains(key.lowercase()) }?.value.orEmpty()
     }
 
     private companion object {

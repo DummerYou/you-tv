@@ -3,9 +3,11 @@ package com.youtv.app.server
 import android.content.Context
 import com.google.gson.Gson
 import com.youtv.app.R
+import com.youtv.app.data.PlaylistTextDecoder
 import com.youtv.app.data.repository.AppSettings
 import fi.iki.elonen.NanoHTTPD
 import java.io.File
+import java.net.URI
 import java.nio.charset.StandardCharsets
 
 class RemoteConfigServer(
@@ -47,7 +49,10 @@ class RemoteConfigServer(
     }
 
     private fun settings(): Response {
-        val channelText = File(context.filesDir, "playlist-text.txt").takeIf(File::exists)?.readText().orEmpty()
+        val channelText = File(context.filesDir, "playlist-text.txt")
+            .takeIf(File::exists)
+            ?.let { file -> runCatching { PlaylistTextDecoder.decode(file.readBytes()) }.getOrDefault("") }
+            .orEmpty()
         val settings = settingsProvider()
         val body = gson.toJson(mapOf(
             "channelUri" to settings.configUrl,
@@ -73,29 +78,23 @@ class RemoteConfigServer(
     }
 
     private fun importText(session: IHTTPSession): Response {
-        val body = readBody(session)
+        val body = PlaylistTextDecoder.decode(readBodyBytes(session))
         if (body.isBlank()) return badRequest("empty playlist")
         onImport(body)
         return ok()
     }
 
     private fun importUrl(session: IHTTPSession): Response {
-        val request = runCatching {
-            @Suppress("UNCHECKED_CAST")
-            gson.fromJson(readBody(session), Map::class.java) as Map<String, Any?>
-        }.getOrNull() ?: return badRequest("invalid json")
+        val request = parseJsonBody(session) ?: return badRequest("invalid json")
         val uri = request["uri"] as? String ?: return badRequest("uri missing")
-        if (!uri.startsWith("http://") && !uri.startsWith("https://")) return badRequest("unsupported uri")
+        val scheme = runCatching { URI(uri).scheme?.lowercase() }.getOrNull()
+        if (scheme !in setOf("http", "https")) return badRequest("unsupported uri")
         onImportUrl(uri)
         return ok()
     }
 
     private fun updateSetting(session: IHTTPSession, field: String): Response {
-        val request = runCatching {
-            @Suppress("UNCHECKED_CAST")
-            gson.fromJson(readBody(session), Map::class.java) as Map<String, Any?>
-        }.getOrNull()
-            ?: return badRequest("invalid json")
+        val request = parseJsonBody(session) ?: return badRequest("invalid json")
         when (field) {
             "proxy" -> (request["proxy"] as? String)?.let(onProxy) ?: return badRequest("proxy missing")
             "epg" -> (request["epg"] as? String)?.let(onEpg) ?: return badRequest("epg missing")
@@ -104,10 +103,7 @@ class RemoteConfigServer(
     }
 
     private fun updateDefaultChannel(session: IHTTPSession): Response {
-        val request = runCatching {
-            @Suppress("UNCHECKED_CAST")
-            gson.fromJson(readBody(session), Map::class.java) as Map<String, Any?>
-        }.getOrNull() ?: return badRequest("invalid json")
+        val request = parseJsonBody(session) ?: return badRequest("invalid json")
         val channel = (request["channel"] as? Number)?.toInt() ?: return badRequest("channel missing")
         if (channel < 0) return badRequest("invalid channel")
         onDefaultChannel(channel)
@@ -125,13 +121,23 @@ class RemoteConfigServer(
 
     private fun parseJsonBody(session: IHTTPSession): Map<String, Any?>? = runCatching {
         @Suppress("UNCHECKED_CAST")
-        gson.fromJson(readBody(session), Map::class.java) as Map<String, Any?>
+        gson.fromJson(readUtf8Body(session), Map::class.java) as Map<String, Any?>
     }.getOrNull()
 
-    private fun readBody(session: IHTTPSession): String {
-        val files = hashMapOf<String, String>()
-        session.parseBody(files)
-        return files["postData"].orEmpty()
+    private fun readUtf8Body(session: IHTTPSession): String =
+        readBodyBytes(session).toString(StandardCharsets.UTF_8)
+
+    private fun readBodyBytes(session: IHTTPSession): ByteArray {
+        val length = session.headers["content-length"]?.toIntOrNull()?.coerceAtMost(MAX_BODY_BYTES.toInt()) ?: 0
+        if (length <= 0) return ByteArray(0)
+        val bytes = ByteArray(length)
+        var offset = 0
+        while (offset < length) {
+            val read = session.inputStream.read(bytes, offset, length - offset)
+            if (read <= 0) break
+            offset += read
+        }
+        return if (offset == bytes.size) bytes else bytes.copyOf(offset)
     }
 
     private fun staticPage(): Response {

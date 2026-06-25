@@ -2,6 +2,7 @@ package com.youtv.app.data.repository
 
 import android.content.Context
 import com.youtv.app.domain.epg.EpgParser
+import com.youtv.app.domain.model.EpgGuide
 import com.youtv.app.domain.model.Program
 import com.youtv.app.requests.HttpClient
 import kotlinx.coroutines.Dispatchers
@@ -14,13 +15,13 @@ import java.io.File
 
 class EpgRepository(context: Context) {
     private val cache = File(context.filesDir, "epg.xml")
-    private val _programs = MutableStateFlow<Map<String, List<Program>>>(emptyMap())
-    val programs: StateFlow<Map<String, List<Program>>> = _programs.asStateFlow()
+    private val _guide = MutableStateFlow(EpgGuide())
+    val guide: StateFlow<EpgGuide> = _guide.asStateFlow()
 
     suspend fun loadCache() = withContext(Dispatchers.IO) {
         if (!cache.exists() || cache.length() == 0L) return@withContext
         runCatching { EpgParser().parse(cache.inputStream()) }
-            .onSuccess { _programs.value = it }
+            .onSuccess { _guide.value = it }
     }
 
     suspend fun refresh(urls: String): Boolean = withContext(Dispatchers.IO) {
@@ -35,7 +36,7 @@ class EpgRepository(context: Context) {
                 }
             }.getOrNull()
             if (result != null) {
-                _programs.value = result
+                _guide.value = result
                 return@withContext true
             }
         }
@@ -44,7 +45,7 @@ class EpgRepository(context: Context) {
 
     fun programsFor(channelName: String): List<Program> {
         val name = channelName.lowercase()
-        return _programs.value.entries.firstOrNull { (key, _) ->
+        return _guide.value.programs.entries.firstOrNull { (key, _) ->
             name.contains(key.lowercase(), ignoreCase = true)
         }?.value.orEmpty()
     }

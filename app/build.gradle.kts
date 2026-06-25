@@ -1,4 +1,3 @@
-import java.io.BufferedReader
 import java.util.Properties
 import com.android.build.gradle.internal.api.BaseVariantOutputImpl
 
@@ -68,14 +67,12 @@ android.applicationVariants.all {
 }
 
 fun getTag(): String {
-    return try {
-        val process = Runtime.getRuntime().exec("git describe --tags --always")
-        process.waitFor()
-        process.inputStream.bufferedReader().use(BufferedReader::readText).trim().removePrefix("v")
+    return runCatching {
+        providers.exec {
+            commandLine("git", "describe", "--tags", "--always")
+        }.standardOutput.asText.get().trim().removePrefix("v")
             .takeIf { it.matches(Regex("\\d+\\.\\d+\\.\\d+(?:\\.\\d+)?(?:-.*)?")) }.orEmpty()
-    } catch (_: Exception) {
-        ""
-    }
+    }.getOrDefault("")
 }
 
 fun getVersionCode(): Int {
@@ -110,6 +107,7 @@ dependencies {
     implementation(libs.nanohttpd)
     implementation(libs.gson)
     implementation(libs.okhttp)
+    implementation(libs.coil.compose)
 
     implementation(libs.core.ktx)
     implementation(libs.coroutines)

@@ -18,17 +18,20 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -45,12 +48,15 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.ui.PlayerView
+import coil.compose.AsyncImage
 import com.youtv.app.domain.model.Channel
 import com.youtv.app.player.PlaybackState
 import com.youtv.app.player.PlayerController
@@ -186,7 +192,7 @@ fun TvApp(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .padding(36.dp)
-                    .background(Color(0xCC000000), RoundedCornerShape(10.dp))
+                    .background(TvGlassStrong, RoundedCornerShape(10.dp))
                     .padding(horizontal = 24.dp, vertical = 12.dp),
                 fontSize = 34.sp,
             )
@@ -229,8 +235,9 @@ fun TvApp(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 28.dp),
-                color = Color(0xE61A1F24),
+                color = TvGlassPanel,
                 shape = RoundedCornerShape(10.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, TvSubtleBorder),
             ) {
                 Text(
                     it,
@@ -258,8 +265,11 @@ private fun ChannelDrawer(
         ?.coerceIn(8, 20) ?: 8
     val panelWidth = (maxChars * 14 + 34).dp
     Surface(
-        modifier = Modifier.fillMaxHeight().width(panelWidth),
-        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(panelWidth)
+            .border(1.dp, TvSubtleBorder),
+        color = TvGlassPanel,
     ) {
         Column(Modifier.padding(horizontal = 9.dp, vertical = 8.dp)) {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(1.dp)) {
@@ -268,8 +278,9 @@ private fun ChannelDrawer(
                     item(group.name) {
                         Text(
                             group.name,
-                            color = MaterialTheme.colorScheme.primary,
+                            color = TvMutedText,
                             fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.padding(top = 6.dp, bottom = 2.dp, start = 5.dp),
                         )
                     }
@@ -310,8 +321,19 @@ private fun FocusableRow(
             .onFocusChanged { focused = it.isFocused }
             .focusRequester(requester)
             .focusable()
-            .border(if (focused) 1.5.dp else 0.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(5.dp))
-            .background(if (playing) Color(0x5534CDB8) else Color.Transparent, RoundedCornerShape(5.dp))
+            .background(
+                when {
+                    focused -> TvFocusFill
+                    playing -> TvPlayingFill
+                    else -> TvRowFill
+                },
+                RoundedCornerShape(5.dp),
+            )
+            .border(
+                if (focused) 1.5.dp else 0.dp,
+                if (focused) TvAccent else Color.Transparent,
+                RoundedCornerShape(5.dp),
+            )
             .clickable(onClick = onClick)
             .padding(horizontal = 7.dp, vertical = 4.dp)
             .onPreviewKeyEvent {
@@ -324,10 +346,18 @@ private fun FocusableRow(
             },
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        ChannelLogo(
+            url = channel.logo,
+            modifier = Modifier.size(18.dp),
+            cornerRadius = 4,
+        )
+        if (channel.logo.isNotBlank()) Spacer(Modifier.width(6.dp))
         Text(
             channel.title,
             modifier = Modifier.weight(1f, fill = false),
             fontSize = 14.sp,
+            color = if (playing) TvAccent else Color.White,
+            fontWeight = if (focused || playing) FontWeight.SemiBold else FontWeight.Normal,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -335,7 +365,7 @@ private fun FocusableRow(
             Spacer(Modifier.width(7.dp))
             Text(
                 metaText,
-                color = if (channel.favorite) MaterialTheme.colorScheme.primary else Color.LightGray,
+                color = if (channel.favorite) TvAccent else TvMutedText,
                 fontSize = 11.sp,
             )
         }
@@ -346,7 +376,16 @@ private fun FocusableRow(
 private fun PlaybackStatus(state: PlaybackState, retry: () -> Unit) {
     when (state) {
         PlaybackState.Idle -> Unit
-        is PlaybackState.Preparing, is PlaybackState.Buffering -> CircularProgressIndicator(Modifier.padding(40.dp))
+        is PlaybackState.Preparing -> LoadingChannelPanel(
+            channel = state.channel,
+            sourceIndex = state.sourceIndex,
+            status = "正在连接",
+        )
+        is PlaybackState.Buffering -> LoadingChannelPanel(
+            channel = state.channel,
+            sourceIndex = state.sourceIndex,
+            status = "正在缓冲",
+        )
         is PlaybackState.Playing -> Unit
         is PlaybackState.Failed -> {
             InfoPanel(
@@ -370,14 +409,63 @@ private fun ChannelInfoPanel(state: MainUiState, playback: PlaybackState) {
     val program = state.programs.firstOrNull()?.title ?: "暂无节目单"
     Surface(
         modifier = Modifier.padding(32.dp).width(560.dp),
-        color = MaterialTheme.colorScheme.surface,
+        color = TvGlassPanel,
         shape = RoundedCornerShape(14.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, TvSubtleBorder),
     ) {
         Column(Modifier.padding(24.dp)) {
-            Text(channel.title, fontSize = 30.sp)
+            Text(channel.title, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
-            Text(program, fontSize = 20.sp, color = Color.LightGray)
-            Text(sourceText, fontSize = 16.sp, color = MaterialTheme.colorScheme.primary)
+            Text(program, fontSize = 20.sp, color = TvSoftText)
+            Text(sourceText, fontSize = 16.sp, color = TvAccent)
+        }
+    }
+}
+
+@Composable
+private fun LoadingChannelPanel(
+    channel: Channel,
+    sourceIndex: Int,
+    status: String,
+) {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Surface(
+            modifier = Modifier.width(360.dp),
+            color = TvGlassPanel,
+            shape = RoundedCornerShape(14.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, TvSubtleBorder),
+        ) {
+            Row(
+                modifier = Modifier.padding(22.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ChannelLogo(
+                    url = channel.logo,
+                    modifier = Modifier.size(52.dp),
+                    cornerRadius = 10,
+                )
+                if (channel.logo.isNotBlank()) Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        channel.title,
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "$status · 来源 ${sourceIndex + 1}/${channel.sources.size.coerceAtLeast(1)}",
+                        color = TvAccent,
+                        fontSize = 14.sp,
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                CircularProgressIndicator(
+                    modifier = Modifier.size(28.dp),
+                    color = TvAccent,
+                    trackColor = TvProgressTrack,
+                )
+            }
         }
     }
 }
@@ -386,14 +474,17 @@ private fun ChannelInfoPanel(state: MainUiState, playback: PlaybackState) {
 private fun VolumeIndicator(volume: VolumeUi, modifier: Modifier = Modifier) {
     Surface(
         modifier = modifier.width(360.dp),
-        color = Color(0xDD101418),
+        color = TvGlassPanel,
         shape = RoundedCornerShape(14.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, TvSubtleBorder),
     ) {
         Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("音量 ${volume.current}/${volume.maximum}", fontSize = 22.sp)
             LinearProgressIndicator(
                 progress = { volume.current.toFloat() / volume.maximum.coerceAtLeast(1) },
                 modifier = Modifier.fillMaxWidth(),
+                color = TvAccent,
+                trackColor = TvProgressTrack,
             )
         }
     }
@@ -412,7 +503,7 @@ private fun TimeDisplay(showSeconds: Boolean, modifier: Modifier = Modifier) {
         SimpleDateFormat(if (showSeconds) "HH:mm:ss" else "HH:mm", Locale.getDefault()).format(Date(now)),
         modifier = modifier
             .padding(16.dp)
-            .background(Color(0x99000000), RoundedCornerShape(5.dp))
+            .background(TvGlassStrong, RoundedCornerShape(5.dp))
             .padding(horizontal = 8.dp, vertical = 4.dp),
         color = Color.White,
         fontSize = 13.sp,
@@ -438,12 +529,15 @@ private fun SettingsPanel(
     onBootStartup: (Boolean) -> Unit,
 ) {
     Surface(
-        modifier = Modifier.fillMaxHeight().width(292.dp),
-        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(292.dp)
+            .border(1.dp, TvSubtleBorder),
+        color = TvGlassPanel,
     ) {
         LazyColumn(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             item {
-            Text("设置", fontSize = 18.sp, modifier = Modifier.padding(start = 5.dp, bottom = 4.dp))
+            Text("设置", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 5.dp, bottom = 4.dp))
             }
             item {
             SettingLine("换台反转", state.settings.channelReversal) { onChannelReversal(!state.settings.channelReversal) }
@@ -478,7 +572,7 @@ private fun SettingsPanel(
             item {
             Text(
                 "当前源：${if (state.settings.sourceMode.name == "URL") "地址源" else "文本源"}",
-                color = MaterialTheme.colorScheme.primary,
+                color = TvAccent,
                 fontSize = 12.sp,
                 modifier = Modifier.padding(horizontal = 5.dp, vertical = 3.dp),
             )
@@ -486,7 +580,7 @@ private fun SettingsPanel(
             item {
             Text(
                 "更新时间：${state.settings.playlistUpdatedAt.ifEmpty { "未提供" }}",
-                color = Color.LightGray, fontSize = 11.sp,
+                color = TvMutedText, fontSize = 11.sp,
                 modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp),
             )
             }
@@ -512,7 +606,7 @@ private fun SettingsPanel(
             Text(
                 remoteAddress?.let { "远程配置：$it（10 分钟后关闭）" }
                     ?: "远程配置已关闭",
-                color = MaterialTheme.colorScheme.primary,
+                color = TvAccent,
                 fontSize = 11.sp,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
@@ -532,7 +626,12 @@ private fun ActionRow(label: String, onClick: () -> Unit) {
             .fillMaxWidth()
             .onFocusChanged { focused = it.isFocused }
             .focusable()
-            .border(if (focused) 1.5.dp else 0.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(5.dp))
+            .background(if (focused) TvFocusFill else TvRowFill, RoundedCornerShape(5.dp))
+            .border(
+                if (focused) 1.5.dp else 0.dp,
+                if (focused) TvAccent else Color.Transparent,
+                RoundedCornerShape(5.dp),
+            )
             .clickable(onClick = onClick)
             .padding(horizontal = 6.dp, vertical = 5.dp)
             .onPreviewKeyEvent {
@@ -541,6 +640,8 @@ private fun ActionRow(label: String, onClick: () -> Unit) {
                 ) { onClick(); true } else false
             },
         fontSize = 14.sp,
+        color = Color.White,
+        fontWeight = if (focused) FontWeight.SemiBold else FontWeight.Normal,
     )
 }
 
@@ -552,7 +653,12 @@ private fun SettingLine(label: String, checked: Boolean, onClick: () -> Unit) {
             .fillMaxWidth()
             .onFocusChanged { focused = it.isFocused }
             .focusable()
-            .border(if (focused) 1.5.dp else 0.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(5.dp))
+            .background(if (focused) TvFocusFill else TvRowFill, RoundedCornerShape(5.dp))
+            .border(
+                if (focused) 1.5.dp else 0.dp,
+                if (focused) TvAccent else Color.Transparent,
+                RoundedCornerShape(5.dp),
+            )
             .clickable(onClick = onClick)
             .padding(horizontal = 6.dp, vertical = 3.dp)
             .onPreviewKeyEvent {
@@ -563,11 +669,32 @@ private fun SettingLine(label: String, checked: Boolean, onClick: () -> Unit) {
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(label, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            label,
+            fontSize = 14.sp,
+            color = Color.White,
+            fontWeight = if (focused) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
         Switch(
             checked = checked,
             onCheckedChange = null,
             modifier = Modifier.height(30.dp).width(42.dp),
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.White,
+                checkedTrackColor = TvAccent,
+                checkedBorderColor = Color.Transparent,
+                uncheckedThumbColor = TvMutedText,
+                uncheckedTrackColor = TvSwitchOffTrack,
+                uncheckedBorderColor = TvSwitchOffBorder,
+                disabledCheckedThumbColor = Color.White,
+                disabledCheckedTrackColor = TvAccent,
+                disabledCheckedBorderColor = Color.Transparent,
+                disabledUncheckedThumbColor = TvMutedText,
+                disabledUncheckedTrackColor = TvSwitchOffTrack,
+                disabledUncheckedBorderColor = TvSwitchOffBorder,
+            ),
         )
     }
 }
@@ -624,11 +751,27 @@ private fun ProgramPanel(
                         }
                         else -> false
                     }
-                },
-            color = MaterialTheme.colorScheme.surface,
+            },
+            color = TvGlassPanel,
+            border = androidx.compose.foundation.BorderStroke(1.dp, TvSubtleBorder),
         ) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                Text(channel?.title.orEmpty(), fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    ChannelLogo(
+                        url = channel?.logo.orEmpty(),
+                        modifier = Modifier.size(34.dp),
+                        cornerRadius = 7,
+                    )
+                    if (!channel?.logo.isNullOrBlank()) Spacer(Modifier.width(8.dp))
+                    Text(
+                        channel?.title.orEmpty(),
+                        modifier = Modifier.weight(1f),
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 if (sources.size > 1) {
                     Row(
                         modifier = Modifier
@@ -649,7 +792,7 @@ private fun ProgramPanel(
                 }
                 LazyColumn(state = programListState, verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     if (state.programs.isEmpty()) {
-                        item { Text("暂无节目单", color = Color.LightGray, fontSize = 13.sp, modifier = Modifier.padding(6.dp)) }
+                        item { Text("暂无节目单", color = TvMutedText, fontSize = 13.sp, modifier = Modifier.padding(6.dp)) }
                     } else {
                         items(state.programs.take(30)) { program ->
                             ProgramRow(program, selected = state.programs.indexOf(program) == selectedProgram)
@@ -677,10 +820,10 @@ private fun SourceChip(
             .onFocusChanged { focused = it.isFocused }
             .focusable()
             .background(
-                if (selected) MaterialTheme.colorScheme.primary else Color(0xFF343B42),
+                if (selected) TvAccent else TvChipFill,
                 RoundedCornerShape(7.dp),
             )
-            .border(if (focused) 1.5.dp else 0.dp, Color.White, RoundedCornerShape(7.dp))
+            .border(if (focused) 1.5.dp else 0.dp, if (focused) Color.White else Color.Transparent, RoundedCornerShape(7.dp))
             .clickable(onClick = onClick)
             .onPreviewKeyEvent {
                 if (it.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
@@ -697,7 +840,8 @@ private fun SourceChip(
             label,
             modifier = Modifier.padding(horizontal = 8.dp),
             fontSize = 11.sp,
-            color = if (selected) Color.Black else Color.White,
+            color = if (selected) TvAccentText else Color.White,
+            fontWeight = if (selected || focused) FontWeight.SemiBold else FontWeight.Normal,
             maxLines = 1,
         )
     }
@@ -711,13 +855,36 @@ private fun ProgramRow(program: com.youtv.app.domain.model.Program, selected: Bo
             .fillMaxWidth()
             .onFocusChanged { focused = it.isFocused }
             .focusable()
-            .background(if (focused || selected) Color(0x3334CDB8) else Color.Transparent, RoundedCornerShape(4.dp))
+            .background(if (focused || selected) TvFocusFill else TvRowFill, RoundedCornerShape(4.dp))
             .padding(horizontal = 6.dp, vertical = 4.dp),
     ) {
-        Text(formatProgramTime(program.beginTime), color = MaterialTheme.colorScheme.primary, fontSize = 11.sp)
+        Text(formatProgramTime(program.beginTime), color = TvAccent, fontSize = 11.sp)
         Spacer(Modifier.width(8.dp))
-        Text(program.title, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            program.title,
+            color = if (focused || selected) Color.White else TvSoftText,
+            fontSize = 13.sp,
+            fontWeight = if (focused || selected) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
+}
+
+@Composable
+private fun ChannelLogo(url: String, modifier: Modifier = Modifier, cornerRadius: Int) {
+    var failed by remember(url) { mutableStateOf(false) }
+    if (url.isBlank() || failed) return
+    AsyncImage(
+        model = url,
+        contentDescription = null,
+        contentScale = ContentScale.Fit,
+        onError = { failed = true },
+        modifier = modifier
+            .clip(RoundedCornerShape(cornerRadius.dp))
+            .background(TvLogoBackdrop, RoundedCornerShape(cornerRadius.dp))
+            .padding(2.dp),
+    )
 }
 
 private fun sourceTypeLabel(type: SourceAddressType): String = when (type) {
@@ -736,7 +903,7 @@ private fun formatProgramTime(value: Int): String {
 private fun DetailText(value: String) {
     Text(
         value,
-        color = Color.LightGray,
+        color = TvMutedText,
         fontSize = 11.sp,
         maxLines = 2,
         overflow = TextOverflow.Ellipsis,
@@ -749,19 +916,36 @@ private fun InfoPanel(title: String, body: String, alignment: Alignment) {
     Box(Modifier.fillMaxSize(), contentAlignment = alignment) {
         Surface(
             modifier = Modifier.width(520.dp).padding(32.dp),
-            color = MaterialTheme.colorScheme.surface,
+            color = TvGlassPanel,
             shape = RoundedCornerShape(14.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, TvSubtleBorder),
         ) {
             Column(Modifier.padding(28.dp)) {
-                Text(title, fontSize = 30.sp)
+                Text(title, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(12.dp))
-                Text(body, fontSize = 19.sp, color = Color.LightGray)
+                Text(body, fontSize = 19.sp, color = TvSoftText)
             }
         }
     }
 }
 
 private data class VolumeUi(val current: Int, val maximum: Int, val eventId: Long)
+
+private val TvAccent = Color(0xFF00FFCC)
+private val TvAccentText = Color(0xFF07120F)
+private val TvGlassPanel = Color(0xD90C1016)
+private val TvGlassStrong = Color(0xCC05080C)
+private val TvSubtleBorder = Color(0x1FFFFFFF)
+private val TvFocusFill = Color(0x2600FFCC)
+private val TvPlayingFill = Color(0x3300FFCC)
+private val TvRowFill = Color(0x08FFFFFF)
+private val TvChipFill = Color(0xFF262D34)
+private val TvSoftText = Color(0xD9FFFFFF)
+private val TvMutedText = Color(0x99FFFFFF)
+private val TvProgressTrack = Color(0x22FFFFFF)
+private val TvSwitchOffTrack = Color(0x26FFFFFF)
+private val TvSwitchOffBorder = Color(0x2EFFFFFF)
+private val TvLogoBackdrop = Color(0x1FFFFFFF)
 
 private const val CHANNEL_NUMBER_DELAY_MILLIS = 1_500L
 private const val VOLUME_DISPLAY_MILLIS = 2_000L
