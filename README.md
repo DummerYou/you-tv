@@ -64,6 +64,8 @@ app/build/outputs/apk/release/you-tv.apk
 
 最新版 APK 请到 [GitHub Releases](../../releases) 下载。
 
+在 Release 页面的 Assets 区域下载 `you-tv.apk`。`Source code (zip)` 和 `Source code (tar.gz)` 是 GitHub 自动生成的源码压缩包，不是 Android 安装包。
+
 第一次使用自动发布前，需要在 GitHub 仓库的 `Settings -> Secrets and variables -> Actions` 里添加这些 Repository secrets：
 
 | Secret | 内容 |
