@@ -1,66 +1,109 @@
-name: build
+name: release
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, for example v1.0.1'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
-      - name: set up JDK 21
+      - name: Resolve release tag
+        id: release_tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){2}([.-].*)?$ ]]; then
+            echo "Tag must look like v1.0.1 or v1.0.1-beta.1" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
           cache: 'gradle'
 
-      - name: Run build with Gradle wrapper
-        run: ./gradlew clean && ./gradlew assembleRelease
+      - name: Build release APK
+        run: ./gradlew clean assembleRelease -x test -x lint
 
-      - name: Sign app APK
+      - name: Sign release APK
         id: sign_app
         uses: r0adkll/sign-android-release@v1
         with:
           releaseDirectory: app/build/outputs/apk/release
-          alias: ${{ secrets.ALIAS }}
+          alias: ${{ secrets.KEY_ALIAS }}
           signingKeyBase64: ${{ secrets.KEYSTORE }}
-          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.ALIAS_PASSWORD }}
+          keyStorePassword: ${{ secrets.STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
         env:
-          # override default build-tools version (29.0.3) -- optional
-          BUILD_TOOLS_VERSION: "34.0.0"
+          BUILD_TOOLS_VERSION: '34.0.0'
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-          body: you-tv release
-
-      - name: Set Asset Name
-        id: set_asset_name
+      - name: Prepare release notes
+        id: notes
+        shell: bash
         run: |
-          echo "asset_name=you-tv.apk" >> $GITHUB_ENV
+          tag="${{ steps.release_tag.outputs.tag }}"
+          version="${tag#v}"
+          notes_file="release-notes.md"
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          if [[ -f CHANGELOG.md ]]; then
+            awk -v version="$version" '
+              BEGIN { capture = 0 }
+              /^##[[:space:]]+/ {
+                if (capture) exit
+                heading = $0
+                if (heading ~ "(^|[^0-9])v?" version "([^0-9]|$)") {
+                  capture = 1
+                  next
+                }
+              }
+              capture { print }
+            ' CHANGELOG.md > "$notes_file"
+          fi
+
+          if [[ ! -s "$notes_file" ]]; then
+            cat > "$notes_file" <<EOF
+自动构建版本 ${tag}。
+
+下载下方的 you-tv.apk 安装包即可。
+EOF
+          fi
+
+          echo "file=$notes_file" >> "$GITHUB_OUTPUT"
+
+      - name: Rename signed APK
+        shell: bash
+        run: cp "${{ steps.sign_app.outputs.signedReleaseFile }}" you-tv.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ steps.sign_app.outputs.signedReleaseFile }}
-          asset_name: ${{ env.asset_name }}
-          asset_content_type: application/vnd.android.package-archive
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: you-tv ${{ steps.release_tag.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.file }}
+          files: you-tv.apk

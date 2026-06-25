@@ -59,3 +59,31 @@ CCTV-5+,http://[2409:8087:1a01:df::7005]:80/live/index.m3u8
 ```text
 app/build/outputs/apk/release/you-tv.apk
 ```
+
+## 下载与发布
+
+最新版 APK 请到 [GitHub Releases](../../releases) 下载。
+
+第一次使用自动发布前，需要在 GitHub 仓库的 `Settings -> Secrets and variables -> Actions` 里添加这些 Repository secrets：
+
+| Secret | 内容 |
+| --- | --- |
+| `KEYSTORE` | 发布签名文件的 Base64 内容 |
+| `STORE_PASSWORD` | keystore 密码 |
+| `KEY_ALIAS` | key alias |
+| `KEY_PASSWORD` | key 密码 |
+
+Windows PowerShell 生成 `KEYSTORE` 内容：
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("youtv-release.keystore")) | Set-Clipboard
+```
+
+发布新版本时，更新 `CHANGELOG.md` 和 `version.json`，然后推送版本标签：
+
+```shell
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+GitHub Actions 会自动构建、签名并发布 `you-tv.apk`。
