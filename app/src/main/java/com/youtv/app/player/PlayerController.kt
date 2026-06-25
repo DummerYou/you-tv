@@ -20,9 +20,15 @@ import com.youtv.app.domain.model.Channel
 import com.youtv.app.domain.model.SourceAddressType
 import com.youtv.app.domain.model.StreamSource
 import com.youtv.app.requests.HttpClient
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 sealed interface PlaybackState {
     data object Idle : PlaybackState
@@ -65,6 +71,10 @@ class PlayerController(
     private var sourceTypeIndex = 0
     private var retryRound = 0
     private var released = false
+    private val controllerJob = SupervisorJob()
+    private val scope = CoroutineScope(controllerJob + Dispatchers.Main.immediate)
+    private var loadTimeoutJob: Job? = null
+    private var loadAttemptToken = 0L
 
     fun play(channel: Channel, preferredSource: Int = 0) {
         if (released || channel.sources.isEmpty()) {
@@ -99,10 +109,22 @@ class PlayerController(
         prepareCurrentSource()
     }
 
-    fun pause() = player.pause()
-    fun resume() = player.play()
+    fun pause() {
+        cancelLoadTimeout()
+        player.pause()
+    }
+
+    fun resume() {
+        player.play()
+        when (val state = _state.value) {
+            is PlaybackState.Preparing -> scheduleLoadTimeout(state.channel, state.sourceIndex, sourceTypeIndex)
+            is PlaybackState.Buffering -> scheduleLoadTimeout(state.channel, state.sourceIndex, sourceTypeIndex)
+            else -> Unit
+        }
+    }
 
     fun stop() {
+        cancelLoadTimeout()
         player.stop()
         _state.value = PlaybackState.Idle
     }
@@ -110,6 +132,8 @@ class PlayerController(
     fun release() {
         if (released) return
         released = true
+        cancelLoadTimeout()
+        controllerJob.cancel()
         player.removeListener(this)
         player.release()
     }
@@ -117,6 +141,7 @@ class PlayerController(
     private fun prepareCurrentSource() {
         val channel = currentChannel ?: return
         if (attemptedSources >= channel.sources.size) {
+            cancelLoadTimeout()
             val last = channel.sources[sourceIndex]
             _state.value = PlaybackState.Failed(
                 channel = channel,
@@ -128,6 +153,7 @@ class PlayerController(
         }
         val source = channel.sources[sourceIndex]
         _state.value = PlaybackState.Preparing(channel, sourceIndex)
+        scheduleLoadTimeout(channel, sourceIndex, sourceTypeIndex)
         player.stop()
         player.clearMediaItems()
         player.setMediaSource(createMediaSource(source, sourceModes(source)[sourceTypeIndex]))
@@ -136,7 +162,6 @@ class PlayerController(
 
     private fun createMediaSource(source: StreamSource, mode: SourceMode): MediaSource {
         val item = MediaItem.fromUri(source.url)
-        val uri = Uri.parse(source.url)
         val dataSource = OkHttpDataSource.Factory(HttpClient.getClientWithProxy()).apply {
             setDefaultRequestProperties(source.headers)
         }
@@ -165,6 +190,7 @@ class PlayerController(
     }
 
     private fun tryNextSource(error: PlaybackException) {
+        cancelLoadTimeout()
         val channel = currentChannel ?: return
         val modes = sourceModes(channel.sources[sourceIndex])
         if (sourceTypeIndex < modes.lastIndex) {
@@ -194,11 +220,55 @@ class PlayerController(
         prepareCurrentSource()
     }
 
+    private fun tryNextSourceAfterTimeout(channel: Channel, timedOutSourceIndex: Int, timedOutModeIndex: Int) {
+        if (released || currentChannel?.id != channel.id) return
+        if (sourceIndex != timedOutSourceIndex || sourceTypeIndex != timedOutModeIndex) return
+        val modes = sourceModes(channel.sources[sourceIndex])
+        if (sourceTypeIndex < modes.lastIndex) {
+            sourceTypeIndex++
+            prepareCurrentSource()
+            return
+        }
+        sourceTypeIndex = 0
+        attemptedSources++
+        if (attemptedSources >= channel.sources.size) {
+            val source = channel.sources[sourceIndex]
+            cancelLoadTimeout()
+            _state.value = PlaybackState.Failed(
+                channel = channel,
+                attemptedSources = attemptedSources,
+                addressType = source.addressType,
+                message = "播放源加载超时",
+            )
+            return
+        }
+        sourceIndex = (sourceIndex + 1) % channel.sources.size
+        prepareCurrentSource()
+    }
+
+    private fun scheduleLoadTimeout(channel: Channel, scheduledSourceIndex: Int, scheduledModeIndex: Int) {
+        loadTimeoutJob?.cancel()
+        val token = ++loadAttemptToken
+        loadTimeoutJob = scope.launch {
+            delay(LOAD_TIMEOUT_MILLIS)
+            if (token == loadAttemptToken) {
+                tryNextSourceAfterTimeout(channel, scheduledSourceIndex, scheduledModeIndex)
+            }
+        }
+    }
+
+    private fun cancelLoadTimeout() {
+        loadAttemptToken++
+        loadTimeoutJob?.cancel()
+        loadTimeoutJob = null
+    }
+
     override fun onPlaybackStateChanged(playbackState: Int) {
         val channel = currentChannel ?: return
         when (playbackState) {
             Player.STATE_BUFFERING -> _state.value = PlaybackState.Buffering(channel, sourceIndex)
             Player.STATE_READY -> if (player.playWhenReady) {
+                cancelLoadTimeout()
                 _state.value = PlaybackState.Playing(channel, sourceIndex)
                 onSourceSucceeded(channel.id, sourceIndex)
             }
@@ -209,6 +279,7 @@ class PlayerController(
 
     override fun onIsPlayingChanged(isPlaying: Boolean) {
         if (isPlaying) {
+            cancelLoadTimeout()
             retryRound = 0
             attemptedSources = 0
         }
@@ -218,5 +289,6 @@ class PlayerController(
 
     private companion object {
         const val MAX_RETRY_ROUNDS = 10
+        const val LOAD_TIMEOUT_MILLIS = 12_000L
     }
 }
