@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit
 
 
 object HttpClient {
-    const val TAG = "HttpClient"
+    private const val TAG = "HttpClient"
 
     private val clientCache = ConcurrentHashMap<String, OkHttpClient>()
 
@@ -46,10 +46,10 @@ object HttpClient {
                     val port = proxyUri.port.takeIf { value -> value > 0 }
                         ?: if (proxyUri.scheme == "https") 443 else 80
                     builder.proxy(Proxy(it, InetSocketAddress(proxyUri.host, port)))
+                    Log.i(TAG, "apply proxy ${proxyUri.scheme}://${proxyUri.host}:$port")
                 }
-                Log.i(TAG, "apply proxy $proxyUri")
             } catch (e: Exception) {
-                Log.e(TAG, "getClientWithProxy", e)
+                Log.w(TAG, "ignore invalid proxy setting")
             }
         }
 

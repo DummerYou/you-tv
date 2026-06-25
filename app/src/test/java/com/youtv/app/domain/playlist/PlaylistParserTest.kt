@@ -1,6 +1,9 @@
 package com.youtv.app.domain.playlist
 
 import com.youtv.app.domain.model.SourceAddressType
+import com.youtv.app.domain.model.SourceAddressClassifier
+import com.youtv.app.data.PlaylistTextDecoder
+import java.nio.charset.Charset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -66,5 +69,39 @@ class PlaylistParserTest {
         val report = parser.parse("央视频道,#genre#\n坏数据\nCCTV-1,http://127.0.0.1/live.m3u8")
         assertEquals(1, report.imported)
         assertEquals(1, report.skipped)
+    }
+
+    @Test
+    fun `txt update metadata and empty result groups are hidden`() {
+        val report = parser.parse(
+            """
+            🕘️更新时间,#genre#
+            2026-06-22 10:53:07,http://127.0.0.1/update.m3u8
+
+            📺央视频道,#genre#
+            CCTV-1,http://127.0.0.1/live.m3u8
+
+            🈳无结果频道,#genre#
+            CETV-1,url
+            """.trimIndent()
+        )
+
+        assertTrue(report.isSuccess)
+        assertEquals("2026-06-22 10:53:07", report.updatedAt)
+        assertEquals(1, report.imported)
+        assertEquals(listOf("📺央视频道"), report.groups.map { it.name })
+    }
+
+    @Test
+    fun `playlist decoder falls back to GB18030`() {
+        val bytes = "央视频道,#genre#".toByteArray(Charset.forName("GB18030"))
+        assertEquals("央视频道,#genre#", PlaylistTextDecoder.decode(bytes))
+    }
+
+    @Test
+    fun `source address classifier recognizes common source types`() {
+        assertEquals(SourceAddressType.IPV4, SourceAddressClassifier.classify("http://127.0.0.1/live.m3u8"))
+        assertEquals(SourceAddressType.IPV6, SourceAddressClassifier.classify("http://[2409:8087::1]/live.m3u8"))
+        assertEquals(SourceAddressType.HOSTNAME, SourceAddressClassifier.classify("https://example.com/live.m3u8"))
     }
 }

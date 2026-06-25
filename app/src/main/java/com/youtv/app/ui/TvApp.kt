@@ -417,7 +417,7 @@ private fun ChannelInfoPanel(state: MainUiState, playback: PlaybackState) {
         shape = RoundedCornerShape(14.dp),
     ) {
         Column(Modifier.padding(24.dp)) {
-            Text(channel.title, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
+            Text(channel.title, fontSize = 30.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
             Text(program, fontSize = 20.sp, color = TvSoftText)
             Text(sourceText, fontSize = 16.sp, color = TvAccent)
@@ -486,7 +486,7 @@ private fun VolumeIndicator(volume: VolumeUi, modifier: Modifier = Modifier) {
         shape = RoundedCornerShape(14.dp),
     ) {
         Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("音量 ${volume.current}/${volume.maximum}", fontSize = 22.sp)
+            Text("音量 ${volume.current}/${volume.maximum}", fontSize = 22.sp, color = Color.White)
             LinearProgressIndicator(
                 progress = { volume.current.toFloat() / volume.maximum.coerceAtLeast(1) },
                 modifier = Modifier.fillMaxWidth(),
@@ -543,7 +543,7 @@ private fun SettingsPanel(
     ) {
         LazyColumn(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             item {
-            Text("设置", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 5.dp, bottom = 4.dp))
+            Text("设置", fontSize = 18.sp, color = Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 5.dp, bottom = 4.dp))
             }
             item {
             SettingLine("换台反转", state.settings.channelReversal) { onChannelReversal(!state.settings.channelReversal) }
@@ -988,7 +988,7 @@ private fun InfoPanel(title: String, body: String, alignment: Alignment) {
             shape = RoundedCornerShape(14.dp),
         ) {
             Column(Modifier.padding(28.dp)) {
-                Text(title, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
+                Text(title, fontSize = 30.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(12.dp))
                 Text(body, fontSize = 19.sp, color = TvSoftText)
             }
