@@ -1,6 +1,7 @@
 package com.youtv.app
 
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
@@ -36,6 +37,8 @@ class ComposeMainActivity : ComponentActivity() {
     private var remoteServer: RemoteConfigServer? = null
     private var remoteTimeout: Job? = null
     private var remoteAddress by mutableStateOf<String?>(null)
+    private var channelDigits = ""
+    private var channelDigitsJob: Job? = null
     private val openPlaylist = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri ?: return@registerForActivityResult
         contentResolver.openInputStream(uri)?.use { input ->
@@ -80,6 +83,72 @@ class ComposeMainActivity : ComponentActivity() {
         }
     }
 
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
+        val state = viewModel.state.value
+        if (state.overlay != Overlay.NONE) {
+            return when (event.keyCode) {
+                KeyEvent.KEYCODE_BACK,
+                KeyEvent.KEYCODE_ESCAPE -> viewModel.closeOverlay()
+                else -> super.dispatchKeyEvent(event)
+            }
+        }
+        return when (event.keyCode) {
+            KeyEvent.KEYCODE_BACK,
+            KeyEvent.KEYCODE_ESCAPE -> {
+                finish()
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER,
+            KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_NUMPAD_ENTER,
+            KeyEvent.KEYCODE_BUTTON_A,
+            KeyEvent.KEYCODE_BUTTON_SELECT -> {
+                viewModel.showOverlay(Overlay.CHANNELS)
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                viewModel.showOverlay(Overlay.PROGRAM)
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                viewModel.showOverlay(Overlay.FAVORITES)
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_CHANNEL_UP -> {
+                viewModel.nextChannel(-1)
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_CHANNEL_DOWN -> {
+                viewModel.nextChannel(1)
+                true
+            }
+            KeyEvent.KEYCODE_MENU,
+            KeyEvent.KEYCODE_SETTINGS,
+            KeyEvent.KEYCODE_BOOKMARK,
+            KeyEvent.KEYCODE_HELP -> {
+                viewModel.showOverlay(Overlay.SETTINGS)
+                true
+            }
+            in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> {
+                if (!state.settings.channelNumber) return super.dispatchKeyEvent(event)
+                val digit = event.keyCode - KeyEvent.KEYCODE_0
+                channelDigits = (channelDigits + digit).takeLast(3)
+                channelDigitsJob?.cancel()
+                channelDigitsJob = lifecycleScope.launch {
+                    delay(CHANNEL_NUMBER_DELAY_MILLIS)
+                    val channelNumber = channelDigits.toIntOrNull()
+                    channelDigits = ""
+                    channelNumber?.let(viewModel::selectChannelNumber)
+                }
+                true
+            }
+            else -> super.dispatchKeyEvent(event)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         enterImmersiveMode()
@@ -98,6 +167,7 @@ class ComposeMainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         stopRemoteServer()
+        channelDigitsJob?.cancel()
         if (this::playerController.isInitialized) playerController.release()
         super.onDestroy()
     }
@@ -140,5 +210,9 @@ class ComposeMainActivity : ComponentActivity() {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             hide(WindowInsetsCompat.Type.systemBars())
         }
+    }
+
+    private companion object {
+        const val CHANNEL_NUMBER_DELAY_MILLIS = 1_500L
     }
 }

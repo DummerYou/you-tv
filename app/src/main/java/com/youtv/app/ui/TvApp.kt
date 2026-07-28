@@ -3,19 +3,25 @@ package com.youtv.app.ui
 import android.view.KeyEvent
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -36,7 +42,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,6 +60,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.youtv.app.domain.model.Channel
+import com.youtv.app.domain.model.ChannelGroup
 import com.youtv.app.player.PlaybackState
 import com.youtv.app.player.PlayerController
 import com.youtv.app.domain.model.SourceAddressType
@@ -74,8 +80,15 @@ fun TvApp(
 ) {
     val state by viewModel.state.collectAsState()
     val playback by playerController.state.collectAsState()
+    val playbackFocusRequester = remember { FocusRequester() }
     var channelDigits by remember { mutableStateOf("") }
     var volumeUi by remember { mutableStateOf<VolumeUi?>(null) }
+
+    LaunchedEffect(state.overlay) {
+        if (state.overlay == Overlay.NONE) {
+            runCatching { playbackFocusRequester.requestFocus() }
+        }
+    }
 
     LaunchedEffect(channelDigits) {
         if (channelDigits.isNotEmpty()) {
@@ -110,12 +123,15 @@ fun TvApp(
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .focusRequester(playbackFocusRequester)
+            .focusable()
             .background(Color.Black)
             .playbackGestures(
                 enabled = state.overlay == Overlay.NONE,
                 onPreviousChannel = { viewModel.nextChannel(-1) },
                 onNextChannel = { viewModel.nextChannel(1) },
                 onShowChannels = { viewModel.showOverlay(Overlay.CHANNELS) },
+                onShowFavorites = { viewModel.showOverlay(Overlay.FAVORITES) },
                 onShowSettings = { viewModel.showOverlay(Overlay.SETTINGS) },
                 onShowProgram = { viewModel.showOverlay(Overlay.PROGRAM) },
                 onShowInfo = viewModel::showInfo,
@@ -124,13 +140,15 @@ fun TvApp(
                 },
             )
             .onPreviewKeyEvent { event ->
-                if (event.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
-                if (event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_ESCAPE) {
+                val native = event.nativeKeyEvent
+                if (native.keyCode == KeyEvent.KEYCODE_ESCAPE && native.action == KeyEvent.ACTION_DOWN) {
                     if (!viewModel.closeOverlay()) onExit()
                     return@onPreviewKeyEvent true
                 }
                 if (state.overlay != Overlay.NONE) return@onPreviewKeyEvent false
-                when (event.nativeKeyEvent.keyCode) {
+                if (native.action != KeyEvent.ACTION_DOWN) {
+                    false
+                } else when (native.keyCode) {
                     KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP -> {
                         viewModel.nextChannel(-1); true
                     }
@@ -141,7 +159,7 @@ fun TvApp(
                         viewModel.showOverlay(Overlay.CHANNELS); true
                     }
                     KeyEvent.KEYCODE_DPAD_LEFT -> { viewModel.showOverlay(Overlay.PROGRAM); true }
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> { viewModel.showOverlay(Overlay.SETTINGS); true }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> { viewModel.showOverlay(Overlay.FAVORITES); true }
                     KeyEvent.KEYCODE_MENU,
                     KeyEvent.KEYCODE_SETTINGS,
                     KeyEvent.KEYCODE_BOOKMARK,
@@ -150,7 +168,7 @@ fun TvApp(
                     }
                     in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> {
                         if (!state.settings.channelNumber) return@onPreviewKeyEvent false
-                        val digit = event.nativeKeyEvent.keyCode - KeyEvent.KEYCODE_0
+                        val digit = native.keyCode - KeyEvent.KEYCODE_0
                         channelDigits = (channelDigits + digit).takeLast(3)
                         true
                     }
@@ -196,13 +214,31 @@ fun TvApp(
         }
 
         AnimatedVisibility(state.overlay == Overlay.CHANNELS) {
-            ChannelDrawer(state, viewModel::selectChannel, viewModel::setFavorite)
+            ChannelDrawer(
+                title = null,
+                groups = state.menuGroups,
+                currentChannel = state.currentChannel,
+                emptyText = "暂无频道",
+                onSelect = viewModel::selectChannel,
+                onFavorite = viewModel::setFavorite,
+            )
+        }
+        AnimatedVisibility(state.overlay == Overlay.FAVORITES) {
+            ChannelDrawer(
+                title = "收藏",
+                groups = listOf(ChannelGroup("收藏频道", state.favoriteSnapshotChannels)),
+                currentChannel = state.currentChannel,
+                emptyText = "暂无收藏频道",
+                onSelect = viewModel::selectChannel,
+                onFavorite = viewModel::setFavorite,
+            )
         }
         AnimatedVisibility(state.overlay == Overlay.PROGRAM) {
-            ProgramPanel(
+            SourceSelectorPanel(
                 state = state,
                 playback = playback,
                 onSelectSource = playerController::selectSource,
+                onClose = { viewModel.closeOverlay() },
             )
         }
         AnimatedVisibility(
@@ -212,8 +248,6 @@ fun TvApp(
             SettingsPanel(
                 state = state,
                 remoteAddress = remoteAddress,
-                onImportFile = onImportFile,
-                onUseTextSource = viewModel::useTextSource,
                 onUseUrlSource = viewModel::refreshSubscription,
                 onChannelReversal = viewModel::setChannelReversal,
                 onChannelNumber = viewModel::setChannelNumber,
@@ -249,17 +283,40 @@ fun TvApp(
 
 @Composable
 private fun ChannelDrawer(
-    state: MainUiState,
+    title: String?,
+    groups: List<ChannelGroup>,
+    currentChannel: Channel?,
+    emptyText: String,
     onSelect: (Channel) -> Unit,
     onFavorite: (Channel, Boolean) -> Unit,
 ) {
-    val maxChars = state.menuGroups.flatMap { it.channels }
+    val visibleGroups = groups.filter { it.channels.isNotEmpty() }
+    val focusTarget = visibleGroups.asSequence()
+        .flatMap { group -> group.channels.asSequence().map { group.name to it } }
+        .firstOrNull { (_, channel) -> channel.id == currentChannel?.id }
+        ?: visibleGroups.firstOrNull()?.channels?.firstOrNull()?.let { visibleGroups.first().name to it }
+    val maxChars = visibleGroups.flatMap { it.channels }
         .maxOfOrNull {
             val sourceChars = if (it.sources.size > 1) "${it.sources.size}源".length + 1 else 0
             it.title.length + sourceChars
         }
         ?.coerceIn(8, 20) ?: 8
     val panelWidth = (maxChars * 14 + 34).dp
+    val listState = rememberLazyListState()
+    val targetIndex = remember(visibleGroups, focusTarget?.second?.id) {
+        val target = focusTarget
+        var index = 0
+        visibleGroups.forEach { group ->
+            if (target != null && target.first == group.name && target.second.id in group.channels.map { it.id }) {
+                return@remember index + 1 + group.channels.indexOfFirst { it.id == target.second.id }
+            }
+            index += 1 + group.channels.size
+        }
+        0
+    }
+    LaunchedEffect(focusTarget?.second?.id, visibleGroups) {
+        if (visibleGroups.isNotEmpty()) runCatching { listState.scrollToItem(targetIndex) }
+    }
     Surface(
         modifier = Modifier
             .fillMaxHeight()
@@ -267,8 +324,25 @@ private fun ChannelDrawer(
         color = TvGlassPanel,
     ) {
         Column(Modifier.padding(horizontal = 9.dp, vertical = 8.dp)) {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                state.menuGroups.forEach { group ->
+            title?.let {
+                Text(
+                    it,
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(start = 5.dp, bottom = 5.dp),
+                )
+            }
+            if (visibleGroups.isEmpty()) {
+                Text(
+                    emptyText,
+                    color = TvMutedText,
+                    fontSize = 14.sp,
+                    modifier = Modifier.padding(8.dp),
+                )
+            } else {
+                LazyColumn(state = listState, verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                    visibleGroups.forEach { group ->
                     val visibleChannels = group.channels
                     item(group.name) {
                         Text(
@@ -282,17 +356,20 @@ private fun ChannelDrawer(
                     items(visibleChannels, key = { "${group.name}:${it.id}" }) { channel ->
                         FocusableRow(
                             channel = channel,
-                            playing = channel.id == state.currentChannel?.id,
-                            requestInitialFocus = channel.id == state.currentChannel?.id,
+                            playing = channel.id == currentChannel?.id,
+                            requestInitialFocus = channel.id == focusTarget?.second?.id &&
+                                group.name == focusTarget.first,
                             onFavorite = { onFavorite(channel, !channel.favorite) },
                         ) { onSelect(channel) }
                     }
                 }
             }
+            }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun FocusableRow(
     channel: Channel,
@@ -330,7 +407,10 @@ private fun FocusableRow(
                 },
                 RoundedCornerShape(5.dp),
             )
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onFavorite,
+            )
             .padding(horizontal = 7.dp, vertical = 4.dp)
             .onPreviewKeyEvent {
                 if (it.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
@@ -521,8 +601,6 @@ private fun TimeDisplay(showSeconds: Boolean, modifier: Modifier = Modifier) {
 private fun SettingsPanel(
     state: MainUiState,
     remoteAddress: String?,
-    onImportFile: () -> Unit,
-    onUseTextSource: () -> Unit,
     onUseUrlSource: () -> Unit,
     onChannelReversal: (Boolean) -> Unit,
     onChannelNumber: (Boolean) -> Unit,
@@ -544,6 +622,44 @@ private fun SettingsPanel(
         LazyColumn(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             item {
             Text("设置", fontSize = 18.sp, color = Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 5.dp, bottom = 4.dp))
+            }
+            item {
+            Text(
+                "当前源：${if (state.settings.sourceMode.name == "URL") "地址源" else "文本源"}",
+                color = TvAccent,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(horizontal = 5.dp, vertical = 3.dp),
+            )
+            }
+            item {
+            Text(
+                "更新时间：${state.settings.playlistUpdatedAt.ifEmpty { "未提供" }}",
+                color = TvMutedText, fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp),
+            )
+            }
+            item {
+            DetailText("订阅：${state.settings.configUrl.ifEmpty { "未设置" }}")
+            }
+            item {
+            DetailText("EPG：${state.settings.epgUrl}")
+            }
+            item {
+            DetailText("代理：${state.settings.proxy.ifEmpty { "未设置" }}")
+            }
+            item {
+            ActionRow("立即更新订阅", requestInitialFocus = true, onClick = onUseUrlSource)
+            }
+            item {
+            Text(
+                remoteAddress?.let { "远程配置：$it（10 分钟后关闭）" }
+                    ?: "远程配置已关闭",
+                color = TvAccent,
+                fontSize = 11.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 5.dp, vertical = 3.dp),
+            )
             }
             item {
             SettingLine("换台反转", state.settings.channelReversal) { onChannelReversal(!state.settings.channelReversal) }
@@ -575,62 +691,23 @@ private fun SettingsPanel(
             item {
             SettingLine("开机自动启动", state.settings.bootStartup) { onBootStartup(!state.settings.bootStartup) }
             }
-            item {
-            Text(
-                "当前源：${if (state.settings.sourceMode.name == "URL") "地址源" else "文本源"}",
-                color = TvAccent,
-                fontSize = 12.sp,
-                modifier = Modifier.padding(horizontal = 5.dp, vertical = 3.dp),
-            )
-            }
-            item {
-            Text(
-                "更新时间：${state.settings.playlistUpdatedAt.ifEmpty { "未提供" }}",
-                color = TvMutedText, fontSize = 11.sp,
-                modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp),
-            )
-            }
-            item {
-            DetailText("订阅：${state.settings.configUrl.ifEmpty { "未设置" }}")
-            }
-            item {
-            DetailText("EPG：${state.settings.epgUrl}")
-            }
-            item {
-            DetailText("代理：${state.settings.proxy.ifEmpty { "未设置" }}")
-            }
-            item {
-            ActionRow("导入文件并使用文本源", onImportFile)
-            }
-            item {
-            ActionRow("使用已保存的文本源", onUseTextSource)
-            }
-            item {
-            ActionRow("使用地址源并立即更新", onUseUrlSource)
-            }
-            item {
-            Text(
-                remoteAddress?.let { "远程配置：$it（10 分钟后关闭）" }
-                    ?: "远程配置已关闭",
-                color = TvAccent,
-                fontSize = 11.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(horizontal = 5.dp, vertical = 3.dp),
-            )
-            }
         }
     }
 }
 
 @Composable
-private fun ActionRow(label: String, onClick: () -> Unit) {
+private fun ActionRow(label: String, requestInitialFocus: Boolean = false, onClick: () -> Unit) {
     var focused by remember { mutableStateOf(false) }
+    val requester = remember { FocusRequester() }
+    LaunchedEffect(requestInitialFocus) {
+        if (requestInitialFocus) runCatching { requester.requestFocus() }
+    }
     Text(
         label,
         modifier = Modifier
             .fillMaxWidth()
             .onFocusChanged { focused = it.isFocused }
+            .focusRequester(requester)
             .focusable()
             .graphicsLayer {
                 scaleX = if (focused) 1.015f else 1f
@@ -689,11 +766,13 @@ private fun SettingLine(label: String, checked: Boolean, onClick: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ProgramPanel(
+private fun SourceSelectorPanel(
     state: MainUiState,
     playback: PlaybackState,
     onSelectSource: (Int) -> Unit,
+    onClose: () -> Unit,
 ) {
     val channel = state.currentChannel
     val sources = channel?.sources.orEmpty()
@@ -703,55 +782,24 @@ private fun ProgramPanel(
         is PlaybackState.Playing -> playback.sourceIndex
         else -> channel?.preferredSource ?: 0
     }.coerceIn(0, (sources.size - 1).coerceAtLeast(0))
-    val requester = remember { FocusRequester() }
-    val programListState = rememberLazyListState()
-    val scope = rememberCoroutineScope()
-    var selectedProgram by remember(channel?.id) { mutableStateOf(0) }
-    var now by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(channel?.id) { runCatching { requester.requestFocus() } }
-    LaunchedEffect(Unit) {
-        while (true) {
-            now = System.currentTimeMillis()
-            delay(30_000)
-        }
-    }
+    var focusedSource by remember(channel?.id, currentSource) { mutableStateOf(currentSource) }
+    val scrollState = rememberScrollState()
 
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
         Surface(
             modifier = Modifier
-                .fillMaxHeight()
-                .widthIn(min = 260.dp, max = 390.dp)
-                .focusRequester(requester)
-                .focusable()
-                .onPreviewKeyEvent {
-                    if (it.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) {
-                        return@onPreviewKeyEvent false
-                    }
-                    when (it.nativeKeyEvent.keyCode) {
-                        KeyEvent.KEYCODE_DPAD_LEFT -> {
-                            if (sources.size <= 1) return@onPreviewKeyEvent false
-                            onSelectSource((currentSource - 1).mod(sources.size)); true
-                        }
-                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                            if (sources.size <= 1) return@onPreviewKeyEvent false
-                            onSelectSource((currentSource + 1).mod(sources.size)); true
-                        }
-                        KeyEvent.KEYCODE_DPAD_UP -> {
-                            selectedProgram = (selectedProgram - 1).coerceAtLeast(0)
-                            scope.launch { programListState.animateScrollToItem(selectedProgram) }
-                            true
-                        }
-                        KeyEvent.KEYCODE_DPAD_DOWN -> {
-                            selectedProgram = (selectedProgram + 1).coerceAtMost((state.programs.size - 1).coerceAtLeast(0))
-                            scope.launch { programListState.animateScrollToItem(selectedProgram) }
-                            true
-                        }
-                        else -> false
-                    }
-            },
+                .fillMaxWidth()
+                .heightIn(max = 260.dp)
+                .padding(20.dp),
             color = TvGlassPanel,
+            shape = RoundedCornerShape(14.dp),
         ) {
-            Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            Column(
+                Modifier
+                    .padding(horizontal = 16.dp, vertical = 14.dp)
+                    .verticalScroll(scrollState),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     ChannelLogo(
                         url = channel?.logo.orEmpty(),
@@ -768,34 +816,31 @@ private fun ProgramPanel(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    Text(
+                        "当前源 ${currentSource + 1}/${sources.size.coerceAtLeast(1)}",
+                        color = TvAccent,
+                        fontSize = 13.sp,
+                    )
                 }
-                if (sources.size > 1) {
-                    Row(
-                        modifier = Modifier
-                            .padding(top = 7.dp, bottom = 6.dp)
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                if (sources.isEmpty()) {
+                    Text("当前频道没有可用播放源", color = TvMutedText, fontSize = 14.sp)
+                } else {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        sources.forEachIndexed { index, source ->
+                        sources.forEachIndexed { index, _ ->
                             SourceChip(
-                                label = "源${index + 1} ${sourceTypeLabel(source.addressType)}",
+                                label = "源${index + 1}",
                                 selected = index == currentSource,
-                                onClick = { onSelectSource(index) },
-                                onPrevious = { onSelectSource((currentSource - 1).mod(sources.size)) },
-                                onNext = { onSelectSource((currentSource + 1).mod(sources.size)) },
-                            )
-                        }
-                    }
-                }
-                LazyColumn(state = programListState, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    if (state.programs.isEmpty()) {
-                        item { Text("暂无节目单", color = TvMutedText, fontSize = 13.sp, modifier = Modifier.padding(6.dp)) }
-                    } else {
-                        items(state.programs.take(30)) { program ->
-                            ProgramRow(
-                                program = program,
-                                selected = state.programs.indexOf(program) == selectedProgram,
-                                nowMillis = now,
+                                focusedAsSource = index == focusedSource,
+                                requestInitialFocus = index == currentSource,
+                                onFocused = {
+                                    focusedSource = index
+                                    if (index != currentSource) onSelectSource(index)
+                                },
+                                onConfirm = onClose,
                             )
                         }
                     }
@@ -809,16 +854,25 @@ private fun ProgramPanel(
 private fun SourceChip(
     label: String,
     selected: Boolean,
-    onClick: () -> Unit,
-    onPrevious: () -> Unit,
-    onNext: () -> Unit,
+    focusedAsSource: Boolean,
+    requestInitialFocus: Boolean,
+    onFocused: () -> Unit,
+    onConfirm: () -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
+    val requester = remember { FocusRequester() }
+    LaunchedEffect(requestInitialFocus) {
+        if (requestInitialFocus) runCatching { requester.requestFocus() }
+    }
     Box(
         modifier = Modifier
-            .widthIn(min = 58.dp)
+            .width(72.dp)
             .height(32.dp)
-            .onFocusChanged { focused = it.isFocused }
+            .onFocusChanged {
+                focused = it.isFocused
+                if (it.isFocused) onFocused()
+            }
+            .focusRequester(requester)
             .focusable()
             .graphicsLayer {
                 scaleX = if (focused) 1.03f else 1f
@@ -827,16 +881,14 @@ private fun SourceChip(
                 shape = RoundedCornerShape(7.dp)
             }
             .background(
-                if (focused || selected) TvAccent else TvChipFill,
+                if (focused || selected || focusedAsSource) TvAccent else TvChipFill,
                 RoundedCornerShape(7.dp),
             )
-            .clickable(onClick = onClick)
+            .clickable(onClick = onConfirm)
             .onPreviewKeyEvent {
                 if (it.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
                 when (it.nativeKeyEvent.keyCode) {
-                    KeyEvent.KEYCODE_DPAD_LEFT -> { onPrevious(); true }
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> { onNext(); true }
-                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { onClick(); true }
+                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { onConfirm(); true }
                     else -> false
                 }
             },
@@ -846,8 +898,8 @@ private fun SourceChip(
             label,
             modifier = Modifier.padding(horizontal = 8.dp),
             fontSize = 11.sp,
-            color = if (selected || focused) TvAccentText else Color.White,
-            fontWeight = if (selected || focused) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected || focused || focusedAsSource) TvAccentText else Color.White,
+            fontWeight = if (selected || focused || focusedAsSource) FontWeight.SemiBold else FontWeight.Normal,
             maxLines = 1,
         )
     }

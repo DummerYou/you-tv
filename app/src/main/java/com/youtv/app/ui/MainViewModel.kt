@@ -29,7 +29,7 @@ import com.youtv.app.requests.HttpClient
 import okhttp3.Request
 import kotlin.coroutines.coroutineContext
 
-enum class Overlay { NONE, CHANNELS, PROGRAM, SETTINGS }
+enum class Overlay { NONE, CHANNELS, FAVORITES, PROGRAM, SETTINGS }
 
 data class MainUiState(
     val groups: List<ChannelGroup> = emptyList(),
@@ -41,17 +41,18 @@ data class MainUiState(
     val message: String? = null,
     val programs: List<Program> = emptyList(),
     val infoVisible: Boolean = false,
+    val favoriteSnapshotIds: List<String> = emptyList(),
 ) {
     val currentChannel: Channel? get() = channels.getOrNull(currentIndex)
     val menuGroups: List<ChannelGroup> get() = buildList {
-        val favorites = channels.filter { it.favorite }
-        if (favorites.isNotEmpty()) add(ChannelGroup("我的收藏", favorites))
         if (settings.showAllChannels) {
             add(ChannelGroup("全部频道", channels))
         } else {
             addAll(groups)
         }
     }
+    val favoriteSnapshotChannels: List<Channel> get() =
+        favoriteSnapshotIds.mapNotNull { id -> channels.firstOrNull { it.id == id } }
 }
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -59,14 +60,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = container.channelRepository
     private val overlay = MutableStateFlow(Overlay.NONE)
     private val infoVisible = MutableStateFlow(false)
+    private val favoriteSnapshotIds = MutableStateFlow<List<String>>(emptyList())
     private val currentIndex = MutableStateFlow(container.legacyPreferences.position.coerceAtLeast(0))
     private val loading = MutableStateFlow(true)
     private val message = MutableStateFlow<String?>(null)
     private var infoHideJob: Job? = null
     private var playlistJob: Job? = null
 
-    private val chrome = combine(overlay, infoVisible) { activeOverlay, showInfo ->
-        activeOverlay to showInfo
+    private val chrome = combine(overlay, infoVisible, favoriteSnapshotIds) { activeOverlay, showInfo, favorites ->
+        Triple(activeOverlay, showInfo, favorites)
     }
 
     private val data = combine(
@@ -81,7 +83,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         currentIndex,
         loading,
         message,
-    ) { (groups, settings, guide), (activeOverlay, showInfo), index, isLoading, currentMessage ->
+    ) { (groups, settings, guide), (activeOverlay, showInfo, favorites), index, isLoading, currentMessage ->
         val allChannels = groups.flatMap { it.channels }
         val safeIndex = index.coerceIn(0, (allChannels.size - 1).coerceAtLeast(0))
         val channelPrograms = allChannels.getOrNull(safeIndex)?.let { channel ->
@@ -90,7 +92,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }.orEmpty()
         MainUiState(
             groups, allChannels, safeIndex, activeOverlay, settings, isLoading,
-            currentMessage, channelPrograms, showInfo,
+            currentMessage, channelPrograms, showInfo, favorites,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), MainUiState())
 
@@ -105,6 +107,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun showOverlay(value: Overlay) {
         infoVisible.value = false
+        if (value == Overlay.FAVORITES && overlay.value != Overlay.FAVORITES) {
+            favoriteSnapshotIds.value = state.value.channels.filter { it.favorite }.map { it.id }
+        }
         overlay.value = if (overlay.value == value) Overlay.NONE else value
     }
 
@@ -122,13 +127,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun closeOverlay(): Boolean {
+        if (overlay.value != Overlay.NONE) {
+            overlay.value = Overlay.NONE
+            infoVisible.value = false
+            return true
+        }
         if (infoVisible.value) {
             infoVisible.value = false
             return true
         }
-        if (overlay.value == Overlay.NONE) return false
-        overlay.value = Overlay.NONE
-        return true
+        return false
     }
 
     fun selectChannel(channel: Channel) {
@@ -159,7 +167,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setFavorite(channel: Channel, favorite: Boolean) {
-        viewModelScope.launch { repository.setFavorite(channel.id, favorite) }
+        viewModelScope.launch {
+            repository.setFavorite(channel.id, favorite)
+            message.value = if (favorite) "已收藏：${channel.title}" else "已取消收藏：${channel.title}"
+        }
     }
 
     fun rememberSuccessfulSource(channelId: String, sourceIndex: Int) {
@@ -283,10 +294,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun initializeChannels() {
-        migrateLegacyChannels()
         val settings = container.settingsRepository.settings.first()
+        val shouldOpenSetup = settings.configUrl.isBlank() && !hasSavedTextSource()
+        migrateLegacyChannels()
         if (settings.sourceMode == PlaylistSourceMode.URL && settings.configUrl.isNotBlank()) {
             updateFromUrl(settings.configUrl, showResult = false)
+        }
+        if (shouldOpenSetup) {
+            overlay.value = Overlay.SETTINGS
         }
     }
 
@@ -327,8 +342,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val context = getApplication<Application>()
         val legacyFile = File(context.filesDir, ACTIVE_PLAYLIST_FILE)
+        val hasLegacyFile = legacyFile.exists() && legacyFile.length() > 0
         val content = withContext(Dispatchers.IO) {
-            if (legacyFile.exists() && legacyFile.length() > 0) {
+            if (hasLegacyFile) {
                 legacyFile.readPlaylistText()
             } else {
                 context.resources.openRawResource(R.raw.channels).use { input ->
@@ -339,10 +355,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val report = repository.importPlaylist(content, migrateLegacyFavorites = true)
         if (report.isSuccess) {
             val textFile = File(context.filesDir, TEXT_PLAYLIST_FILE)
-            if (!textFile.exists()) withContext(Dispatchers.IO) { textFile.writeText(content) }
+            if (hasLegacyFile && !textFile.exists()) withContext(Dispatchers.IO) { textFile.writeText(content) }
             saveMetadata(report.updatedAt)
         }
         message.value = if (!report.isSuccess) "旧频道数据迁移失败，已保留原文件" else null
+    }
+
+    private suspend fun hasSavedTextSource(): Boolean = withContext(Dispatchers.IO) {
+        listOf(TEXT_PLAYLIST_FILE, ACTIVE_PLAYLIST_FILE).any { name ->
+            File(getApplication<Application>().filesDir, name).let { it.exists() && it.length() > 0 }
+        }
     }
 
     private fun launchPlaylistTask(
@@ -386,8 +408,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
     private fun EpgGuide.logoFor(channelName: String): String {
-        val name = channelName.lowercase()
-        return logos.entries.firstOrNull { (key, _) -> name.contains(key.lowercase()) }?.value.orEmpty()
+        val name = channelName.normalizedChannelName()
+        val epgLogo = logos.entries.firstOrNull { (key, _) ->
+            val candidate = key.normalizedChannelName()
+            name.contains(candidate) || candidate.contains(name)
+        }?.value.orEmpty()
+        return epgLogo.ifBlank { fallbackLogoFor(channelName) }
+    }
+
+    private fun String.normalizedChannelName(): String =
+        lowercase()
+            .replace(Regex("""[^\p{IsHan}a-z0-9]+"""), "")
+
+    private fun fallbackLogoFor(channelName: String): String {
+        val compact = channelName.uppercase()
+            .replace("CCTV-", "CCTV")
+            .replace("CCTV ", "CCTV")
+        val key = when {
+            "CCTV5+" in compact -> "CCTV5+"
+            "CCTV4K" in compact -> "CCTV4K"
+            else -> Regex("""CCTV(\d{1,2})""").find(compact)?.value
+                ?: COMMON_LOGO_NAMES.firstOrNull { channelName.normalizedChannelName().contains(it.normalizedChannelName()) }
+        } ?: return ""
+        return "https://live.fanmingming.com/tv/$key.png"
     }
 
     private companion object {
@@ -395,5 +438,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val ACTIVE_PLAYLIST_FILE = "channels.txt"
         const val TEXT_PLAYLIST_FILE = "playlist-text.txt"
         const val URL_PLAYLIST_FILE = "playlist-url.txt"
+        val COMMON_LOGO_NAMES = listOf(
+            "CGTN", "湖南卫视", "浙江卫视", "江苏卫视", "东方卫视", "北京卫视",
+            "广东卫视", "深圳卫视", "安徽卫视", "山东卫视", "河南卫视", "湖北卫视",
+            "四川卫视", "重庆卫视", "东南卫视", "江西卫视", "辽宁卫视", "天津卫视",
+            "河北卫视", "黑龙江卫视", "吉林卫视", "广西卫视", "云南卫视", "贵州卫视",
+            "海南卫视", "青海卫视", "甘肃卫视", "宁夏卫视", "新疆卫视", "西藏卫视",
+            "内蒙古卫视", "兵团卫视", "金鹰卡通", "卡酷少儿", "炫动卡通",
+        )
     }
 }

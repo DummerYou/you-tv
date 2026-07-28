@@ -50,7 +50,7 @@ class PlaylistParser(private val gson: Gson = Gson()) {
             }
             val title = line.substring(0, separator).trim()
             if (updateMetadataGroup) {
-                if (updatedAt == null && title.isNotEmpty()) updatedAt = title
+                if (updatedAt == null && title.isNotEmpty()) updatedAt = updateTimeText(title)
                 return@forEachIndexed
             }
             if (skipCurrentGroup) return@forEachIndexed
@@ -75,6 +75,8 @@ class PlaylistParser(private val gson: Gson = Gson()) {
         var headers = linkedMapOf<String, String>()
         var epgUrl: String? = null
         var sourceCount = 0
+        var updatedAt: String? = null
+        var skipCurrentItem = false
 
         fun flush() {
             val item = current ?: return
@@ -86,6 +88,7 @@ class PlaylistParser(private val gson: Gson = Gson()) {
             }
             current = null
             headers = linkedMapOf()
+            skipCurrentItem = false
         }
 
         text.lineSequence().forEachIndexed { index, raw ->
@@ -95,10 +98,16 @@ class PlaylistParser(private val gson: Gson = Gson()) {
                 line.startsWith("#EXTINF", true) -> {
                     flush()
                     val title = line.substringAfterLast(',').trim()
+                    val group = attribute(line, "group-title").orEmpty()
+                    if (group.contains("更新时间")) {
+                        if (updatedAt == null && title.isNotEmpty()) updatedAt = updateTimeText(title)
+                        skipCurrentItem = true
+                        return@forEachIndexed
+                    }
                     current = MutableChannel(
                         name = attribute(line, "tvg-name").orEmpty().ifEmpty { title },
                         title = title,
-                        group = attribute(line, "group-title").orEmpty(),
+                        group = group,
                         logo = attribute(line, "tvg-logo").orEmpty(),
                         number = attribute(line, "tvg-chno")?.toIntOrNull() ?: -1,
                     )
@@ -108,7 +117,9 @@ class PlaylistParser(private val gson: Gson = Gson()) {
                     if (pair.size == 2) headers[pair[0]] = pair[1]
                 }
                 line.isNotEmpty() && !line.startsWith('#') -> {
-                    if (current == null || !isSupportedUri(line)) {
+                    if (skipCurrentItem) {
+                        skipCurrentItem = false
+                    } else if (current == null || !isSupportedUri(line)) {
                         issues += ImportIssue(index + 1, "播放地址缺少 EXTINF 或格式无效")
                     } else {
                         current?.sources?.add(StreamSource(line, headers.toMap()))
@@ -117,7 +128,7 @@ class PlaylistParser(private val gson: Gson = Gson()) {
             }
         }
         flush()
-        return buildReport(groups, sourceCount, issues, epgUrl)
+        return buildReport(groups, sourceCount, issues, epgUrl, updatedAt)
     }
 
     private fun parseJson(text: String): ImportReport {
@@ -183,9 +194,21 @@ class PlaylistParser(private val gson: Gson = Gson()) {
         uri.isAbsolute && uri.scheme.lowercase() in setOf("http", "https", "rtsp", "rtmp", "file", "content")
     }.getOrDefault(false)
 
-    private fun attribute(line: String, name: String): String? =
-        Regex("""(?:^|\s)${Regex.escape(name)}="([^"]*)""", RegexOption.IGNORE_CASE)
+    private fun attribute(line: String, name: String): String? {
+        val escaped = Regex.escape(name)
+        Regex("(?:^|\\s)$escaped\\s*=\\s*\"([^\"]*)\"", RegexOption.IGNORE_CASE)
+            .find(line)?.groupValues?.get(1)?.trim()?.let { return it }
+        Regex("""(?:^|\s)$escaped\s*=\s*'([^']*)'""", RegexOption.IGNORE_CASE)
+            .find(line)?.groupValues?.get(1)?.trim()?.let { return it }
+        return Regex("""(?:^|\s)$escaped\s*=\s*([^\s,]+)""", RegexOption.IGNORE_CASE)
             .find(line)?.groupValues?.get(1)?.trim()
+    }
+
+    private fun updateTimeText(value: String): String =
+        value.removePrefix("更新时间")
+            .trim()
+            .trimStart(':', '：', '-', ' ')
+            .trim()
 
     private fun stableId(group: String, name: String): String {
         val bytes = MessageDigest.getInstance("SHA-256").digest("$group\u0000$name".toByteArray())

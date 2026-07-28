@@ -70,6 +70,7 @@ class PlayerController(
     private var attemptedSources = 0
     private var sourceTypeIndex = 0
     private var retryRound = 0
+    private var manuallySelectedSource = false
     private var released = false
     private val controllerJob = SupervisorJob()
     private val scope = CoroutineScope(controllerJob + Dispatchers.Main.immediate)
@@ -90,6 +91,7 @@ class PlayerController(
         attemptedSources = 0
         sourceTypeIndex = 0
         retryRound = 0
+        manuallySelectedSource = false
         prepareCurrentSource()
     }
 
@@ -99,6 +101,7 @@ class PlayerController(
         attemptedSources = 0
         sourceTypeIndex = 0
         retryRound = 0
+        manuallySelectedSource = true
         prepareCurrentSource()
     }
 
@@ -205,15 +208,14 @@ class PlayerController(
             return
         }
         retryRound = 0
+        if (manuallySelectedSource) {
+            failCurrentSource(channel, 1, channel.sources[sourceIndex].addressType, error.errorCodeName)
+            return
+        }
         attemptedSources++
         if (attemptedSources >= channel.sources.size) {
             val source = channel.sources[sourceIndex]
-            _state.value = PlaybackState.Failed(
-                channel,
-                attemptedSources,
-                source.addressType,
-                error.errorCodeName,
-            )
+            failCurrentSource(channel, attemptedSources, source.addressType, error.errorCodeName)
             return
         }
         sourceIndex = (sourceIndex + 1) % channel.sources.size
@@ -230,20 +232,38 @@ class PlayerController(
             return
         }
         sourceTypeIndex = 0
+        if (manuallySelectedSource) {
+            failCurrentSource(
+                channel = channel,
+                attempts = 1,
+                addressType = channel.sources[sourceIndex].addressType,
+                message = "所选播放源加载超时",
+            )
+            return
+        }
         attemptedSources++
         if (attemptedSources >= channel.sources.size) {
             val source = channel.sources[sourceIndex]
-            cancelLoadTimeout()
-            _state.value = PlaybackState.Failed(
-                channel = channel,
-                attemptedSources = attemptedSources,
-                addressType = source.addressType,
-                message = "播放源加载超时",
-            )
+            failCurrentSource(channel, attemptedSources, source.addressType, "播放源加载超时")
             return
         }
         sourceIndex = (sourceIndex + 1) % channel.sources.size
         prepareCurrentSource()
+    }
+
+    private fun failCurrentSource(
+        channel: Channel,
+        attempts: Int,
+        addressType: SourceAddressType,
+        message: String,
+    ) {
+        cancelLoadTimeout()
+        _state.value = PlaybackState.Failed(
+            channel = channel,
+            attemptedSources = attempts,
+            addressType = addressType,
+            message = message,
+        )
     }
 
     private fun scheduleLoadTimeout(channel: Channel, scheduledSourceIndex: Int, scheduledModeIndex: Int) {
@@ -269,6 +289,7 @@ class PlayerController(
             Player.STATE_BUFFERING -> _state.value = PlaybackState.Buffering(channel, sourceIndex)
             Player.STATE_READY -> if (player.playWhenReady) {
                 cancelLoadTimeout()
+                manuallySelectedSource = false
                 _state.value = PlaybackState.Playing(channel, sourceIndex)
                 onSourceSucceeded(channel.id, sourceIndex)
             }

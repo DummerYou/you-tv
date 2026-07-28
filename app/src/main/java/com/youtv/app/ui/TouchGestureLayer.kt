@@ -31,6 +31,7 @@ fun Modifier.playbackGestures(
     onPreviousChannel: () -> Unit,
     onNextChannel: () -> Unit,
     onShowChannels: () -> Unit,
+    onShowFavorites: () -> Unit,
     onShowSettings: () -> Unit,
     onShowProgram: () -> Unit,
     onShowInfo: () -> Unit,
@@ -53,6 +54,7 @@ fun Modifier.playbackGestures(
     val currentPrevious by rememberUpdatedState(onPreviousChannel)
     val currentNext by rememberUpdatedState(onNextChannel)
     val currentChannels by rememberUpdatedState(onShowChannels)
+    val currentFavorites by rememberUpdatedState(onShowFavorites)
     val currentSettings by rememberUpdatedState(onShowSettings)
     val currentProgram by rememberUpdatedState(onShowProgram)
     val currentInfo by rememberUpdatedState(onShowInfo)
@@ -81,7 +83,11 @@ fun Modifier.playbackGestures(
                             tracking.longPressTriggered = true
                             tracking.pendingSingleTap?.cancel()
                             tracking.lastTapUpTime = 0L
-                            currentProgram()
+                            if (size.width > 0 && tracking.start.x < size.width * LONG_PRESS_LEFT_FRACTION) {
+                                currentFavorites()
+                            } else {
+                                currentProgram()
+                            }
                         }
                     }
                 }
@@ -188,6 +194,7 @@ private class GestureTracking {
 }
 
 private const val CHANNEL_ZONE_FRACTION = 0.75f
+private const val LONG_PRESS_LEFT_FRACTION = 0.5f
 private const val CHANNEL_SWIPE_FRACTION = 0.15f
 private const val DIRECTION_RATIO = 1.2f
 private const val DOUBLE_TAP_MILLIS = 320L

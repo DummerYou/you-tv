@@ -76,7 +76,7 @@ class PlaylistParserTest {
         val report = parser.parse(
             """
             🕘️更新时间,#genre#
-            2026-06-22 10:53:07,http://127.0.0.1/update.m3u8
+            更新时间2026-06-22 10:53:07,http://127.0.0.1/update.m3u8
 
             📺央视频道,#genre#
             CCTV-1,http://127.0.0.1/live.m3u8
@@ -90,6 +90,41 @@ class PlaylistParserTest {
         assertEquals("2026-06-22 10:53:07", report.updatedAt)
         assertEquals(1, report.imported)
         assertEquals(listOf("📺央视频道"), report.groups.map { it.name })
+    }
+
+    @Test
+    fun `M3U update metadata group is hidden and saved`() {
+        val report = parser.parse(
+            """
+            #EXTM3U
+            #EXTINF:-1 group-title="更新时间",更新时间2026-07-26 21:51:51
+            https://sf1-cdn-tos.huoshanstatic.com/obj/media-fe/xgplayer_doc_video/mp4/xgplayer-demo-720p.mp4
+            #EXTINF:-1 tvg-name="CCTV1" tvg-logo="https://example.com/cctv1.png" group-title="央视频道",CCTV-1
+            http://127.0.0.1/live.m3u8
+            """.trimIndent()
+        )
+
+        assertTrue(report.isSuccess)
+        assertEquals("2026-07-26 21:51:51", report.updatedAt)
+        assertEquals(1, report.imported)
+        assertEquals(listOf("央视频道"), report.groups.map { it.name })
+    }
+
+    @Test
+    fun `M3U logo attribute accepts quoted and unquoted values`() {
+        val report = parser.parse(
+            """
+            #EXTM3U
+            #EXTINF:-1 tvg-name='CCTV1' tvg-logo='https://example.com/cctv1.png' group-title='央视频道',CCTV-1
+            http://127.0.0.1/one.m3u8
+            #EXTINF:-1 tvg-name=CCTV2 tvg-logo=https://example.com/cctv2.png group-title=央视频道,CCTV-2
+            http://127.0.0.1/two.m3u8
+            """.trimIndent()
+        )
+
+        val channels = report.groups.single().channels
+        assertEquals("https://example.com/cctv1.png", channels[0].logo)
+        assertEquals("https://example.com/cctv2.png", channels[1].logo)
     }
 
     @Test
