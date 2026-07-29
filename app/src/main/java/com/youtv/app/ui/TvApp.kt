@@ -3,15 +3,15 @@ package com.youtv.app.ui
 import android.view.KeyEvent
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -41,7 +41,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,6 +50,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -64,11 +64,14 @@ import com.youtv.app.domain.model.ChannelGroup
 import com.youtv.app.player.PlaybackState
 import com.youtv.app.player.PlayerController
 import com.youtv.app.domain.model.SourceAddressType
+import com.youtv.app.domain.model.SourceHealthStatus
+import com.youtv.app.domain.model.SourceQualityAge
+import com.youtv.app.domain.model.SourceQualityPolicy
+import com.youtv.app.domain.model.StreamSource
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 @Composable
 fun TvApp(
@@ -134,7 +137,7 @@ fun TvApp(
                 onShowFavorites = { viewModel.showOverlay(Overlay.FAVORITES) },
                 onShowSettings = { viewModel.showOverlay(Overlay.SETTINGS) },
                 onShowProgram = { viewModel.showOverlay(Overlay.PROGRAM) },
-                onShowInfo = viewModel::showInfo,
+                onShowInfo = viewModel::toggleInfo,
                 onVolumeChanged = { current, maximum ->
                     volumeUi = VolumeUi(current, maximum, System.nanoTime())
                 },
@@ -142,33 +145,73 @@ fun TvApp(
             .onPreviewKeyEvent { event ->
                 val native = event.nativeKeyEvent
                 if (native.keyCode == KeyEvent.KEYCODE_ESCAPE && native.action == KeyEvent.ACTION_DOWN) {
-                    if (!viewModel.closeOverlay()) onExit()
+                    if (native.repeatCount == 0 && !viewModel.closeOverlay()) onExit()
                     return@onPreviewKeyEvent true
                 }
                 if (state.overlay != Overlay.NONE) return@onPreviewKeyEvent false
                 if (native.action != KeyEvent.ACTION_DOWN) {
                     false
                 } else when (native.keyCode) {
-                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP -> {
+                    KeyEvent.KEYCODE_DPAD_UP,
+                    KeyEvent.KEYCODE_CHANNEL_UP,
+                    KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                        if (native.repeatCount > 0) return@onPreviewKeyEvent true
                         viewModel.nextChannel(-1); true
                     }
-                    KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN -> {
+                    KeyEvent.KEYCODE_DPAD_DOWN,
+                    KeyEvent.KEYCODE_CHANNEL_DOWN,
+                    KeyEvent.KEYCODE_MEDIA_NEXT -> {
+                        if (native.repeatCount > 0) return@onPreviewKeyEvent true
                         viewModel.nextChannel(1); true
                     }
-                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                    in CONFIRM_KEY_CODES -> {
+                        if (native.repeatCount > 0) return@onPreviewKeyEvent true
                         viewModel.showOverlay(Overlay.CHANNELS); true
                     }
-                    KeyEvent.KEYCODE_DPAD_LEFT -> { viewModel.showOverlay(Overlay.PROGRAM); true }
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> { viewModel.showOverlay(Overlay.FAVORITES); true }
+                    KeyEvent.KEYCODE_DPAD_LEFT -> {
+                        if (native.repeatCount == 0) viewModel.showOverlay(Overlay.PROGRAM)
+                        true
+                    }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                        if (native.repeatCount == 0) viewModel.showOverlay(Overlay.FAVORITES)
+                        true
+                    }
+                    KeyEvent.KEYCODE_INFO -> {
+                        if (native.repeatCount == 0) viewModel.toggleInfo()
+                        true
+                    }
+                    KeyEvent.KEYCODE_GUIDE -> {
+                        if (native.repeatCount == 0) viewModel.showOverlay(Overlay.PROGRAM)
+                        true
+                    }
+                    KeyEvent.KEYCODE_MEDIA_PLAY -> {
+                        if (native.repeatCount == 0) playerController.resume()
+                        true
+                    }
+                    KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+                        if (native.repeatCount == 0) playerController.pause()
+                        true
+                    }
+                    KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                        if (native.repeatCount == 0) playerController.togglePlayPause()
+                        true
+                    }
                     KeyEvent.KEYCODE_MENU,
                     KeyEvent.KEYCODE_SETTINGS,
                     KeyEvent.KEYCODE_BOOKMARK,
                     KeyEvent.KEYCODE_HELP -> {
-                        viewModel.showOverlay(Overlay.SETTINGS); true
+                        if (native.repeatCount == 0) viewModel.showOverlay(Overlay.SETTINGS)
+                        true
                     }
-                    in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> {
+                    in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9,
+                    in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_9 -> {
                         if (!state.settings.channelNumber) return@onPreviewKeyEvent false
-                        val digit = native.keyCode - KeyEvent.KEYCODE_0
+                        if (native.repeatCount > 0) return@onPreviewKeyEvent true
+                        val digit = if (native.keyCode in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9) {
+                            native.keyCode - KeyEvent.KEYCODE_0
+                        } else {
+                            native.keyCode - KeyEvent.KEYCODE_NUMPAD_0
+                        }
                         channelDigits = (channelDigits + digit).takeLast(3)
                         true
                     }
@@ -415,19 +458,26 @@ private fun FocusableRow(
             .onPreviewKeyEvent {
                 if (it.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
                 when (it.nativeKeyEvent.keyCode) {
-                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { onClick(); true }
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> { onFavorite(); true }
+                    in CONFIRM_KEY_CODES -> {
+                        if (it.nativeKeyEvent.repeatCount == 0) onClick()
+                        true
+                    }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                        if (it.nativeKeyEvent.repeatCount == 0) onFavorite()
+                        true
+                    }
                     else -> false
                 }
             },
         verticalAlignment = Alignment.CenterVertically,
     ) {
         ChannelLogo(
+            name = channel.name.ifBlank { channel.title },
             url = channel.logo,
             modifier = Modifier.size(18.dp),
             cornerRadius = 4,
         )
-        if (channel.logo.isNotBlank()) Spacer(Modifier.width(6.dp))
+        Spacer(Modifier.width(6.dp))
         Text(
             channel.title,
             modifier = Modifier.weight(1f, fill = false),
@@ -492,7 +542,10 @@ private fun ChannelInfoPanel(state: MainUiState, playback: PlaybackState) {
     }
     val program = state.programs.firstOrNull()?.title ?: "暂无节目单"
     Surface(
-        modifier = Modifier.padding(32.dp).width(560.dp),
+        modifier = Modifier
+            .widthIn(max = 560.dp)
+            .fillMaxWidth(0.86f)
+            .padding(24.dp),
         color = TvGlassPanel,
         shape = RoundedCornerShape(14.dp),
     ) {
@@ -518,7 +571,9 @@ private fun LoadingChannelPanel(
     }
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Surface(
-            modifier = Modifier.width(360.dp),
+            modifier = Modifier
+                .widthIn(max = 420.dp)
+                .fillMaxWidth(0.82f),
             color = TvGlassPanel,
             shape = RoundedCornerShape(14.dp),
         ) {
@@ -527,11 +582,12 @@ private fun LoadingChannelPanel(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 ChannelLogo(
+                    name = channel.name.ifBlank { channel.title },
                     url = channel.logo,
                     modifier = Modifier.size(52.dp),
                     cornerRadius = 10,
                 )
-                if (channel.logo.isNotBlank()) Spacer(Modifier.width(14.dp))
+                Spacer(Modifier.width(14.dp))
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
                         channel.title,
@@ -561,7 +617,9 @@ private fun LoadingChannelPanel(
 @Composable
 private fun VolumeIndicator(volume: VolumeUi, modifier: Modifier = Modifier) {
     Surface(
-        modifier = modifier.width(360.dp),
+        modifier = modifier
+            .widthIn(max = 420.dp)
+            .fillMaxWidth(0.82f),
         color = TvGlassPanel,
         shape = RoundedCornerShape(14.dp),
     ) {
@@ -616,7 +674,8 @@ private fun SettingsPanel(
     Surface(
         modifier = Modifier
             .fillMaxHeight()
-            .width(292.dp),
+            .widthIn(min = 280.dp, max = 340.dp)
+            .fillMaxWidth(),
         color = TvGlassPanel,
     ) {
         LazyColumn(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -720,8 +779,11 @@ private fun ActionRow(label: String, requestInitialFocus: Boolean = false, onCli
             .padding(horizontal = 6.dp, vertical = 5.dp)
             .onPreviewKeyEvent {
                 if (it.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
-                    it.nativeKeyEvent.keyCode in listOf(KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER)
-                ) { onClick(); true } else false
+                    it.nativeKeyEvent.keyCode in CONFIRM_KEY_CODES
+                ) {
+                    if (it.nativeKeyEvent.repeatCount == 0) onClick()
+                    true
+                } else false
             },
         fontSize = 14.sp,
         color = if (focused) TvAccentText else Color.White,
@@ -748,8 +810,11 @@ private fun SettingLine(label: String, checked: Boolean, onClick: () -> Unit) {
             .padding(horizontal = 6.dp, vertical = 3.dp)
             .onPreviewKeyEvent {
                 if (it.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
-                    it.nativeKeyEvent.keyCode in listOf(KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER)
-                ) { onClick(); true } else false
+                    it.nativeKeyEvent.keyCode in CONFIRM_KEY_CODES
+                ) {
+                    if (it.nativeKeyEvent.repeatCount == 0) onClick()
+                    true
+                } else false
             },
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
@@ -782,31 +847,53 @@ private fun SourceSelectorPanel(
         is PlaybackState.Playing -> playback.sourceIndex
         else -> channel?.preferredSource ?: 0
     }.coerceIn(0, (sources.size - 1).coerceAtLeast(0))
-    var focusedSource by remember(channel?.id, currentSource) { mutableStateOf(currentSource) }
-    val scrollState = rememberScrollState()
+    val initialCurrentSource = remember(channel?.id) { currentSource }
+    val frozenOrder = remember(channel?.id) {
+        rankedSourceIndices(sources, currentSource).take(MAX_VISIBLE_SOURCES)
+    }
+    val displayOrder = remember(frozenOrder, currentSource) {
+        (listOf(currentSource) + frozenOrder.filterNot { it == currentSource })
+            .filter { it in sources.indices }
+            .take(MAX_VISIBLE_SOURCES)
+    }
+    var focusedSource by remember(channel?.id) { mutableStateOf(currentSource) }
+    val columns = displayOrder.size.coerceIn(1, MAX_SOURCE_COLUMNS)
 
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+    BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+        val rows = ((displayOrder.size + columns - 1) / columns).coerceAtLeast(1)
+        val gapsWidth = SOURCE_CARD_GAP * (columns - 1)
+        val gapsHeight = SOURCE_CARD_GAP * (rows - 1)
+        val availableWidth = (maxWidth - 72.dp).coerceAtLeast(1.dp)
+        val cardWidth = minOf(SOURCE_CARD_WIDTH, (availableWidth - gapsWidth) / columns)
+            .coerceAtLeast(100.dp)
+        val compactHeight = maxHeight < 500.dp
+        val panelBottomPadding = if (compactHeight) 8.dp else 20.dp
+        val reservedHeight = if (compactHeight) 80.dp else 92.dp
+        val cardHeight = minOf(
+            SOURCE_CARD_HEIGHT,
+            ((maxHeight - reservedHeight - gapsHeight) / rows).coerceAtLeast(62.dp),
+        )
+        val flowWidth = cardWidth * columns + gapsWidth
+        val panelWidth = flowWidth + 32.dp + SOURCE_LAYOUT_TOLERANCE
         Surface(
             modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(max = 260.dp)
-                .padding(20.dp),
+                .width(panelWidth)
+                .padding(bottom = panelBottomPadding),
             color = TvGlassPanel,
             shape = RoundedCornerShape(14.dp),
         ) {
             Column(
-                Modifier
-                    .padding(horizontal = 16.dp, vertical = 14.dp)
-                    .verticalScroll(scrollState),
+                Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     ChannelLogo(
+                        name = (channel?.name?.takeIf { it.isNotBlank() } ?: channel?.title).orEmpty(),
                         url = channel?.logo.orEmpty(),
                         modifier = Modifier.size(34.dp),
                         cornerRadius = 7,
                     )
-                    if (!channel?.logo.isNullOrBlank()) Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(8.dp))
                     Text(
                         channel?.title.orEmpty(),
                         modifier = Modifier.weight(1f),
@@ -817,7 +904,11 @@ private fun SourceSelectorPanel(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        "当前源 ${currentSource + 1}/${sources.size.coerceAtLeast(1)}",
+                        if (sources.size > MAX_VISIBLE_SOURCES) {
+                            "当前源 ${currentSource + 1}/${sources.size} · 显示前 $MAX_VISIBLE_SOURCES 个"
+                        } else {
+                            "当前源 ${currentSource + 1}/${sources.size.coerceAtLeast(1)}"
+                        },
                         color = TvAccent,
                         fontSize = 13.sp,
                     )
@@ -826,21 +917,28 @@ private fun SourceSelectorPanel(
                     Text("当前频道没有可用播放源", color = TvMutedText, fontSize = 14.sp)
                 } else {
                     FlowRow(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.width(flowWidth),
+                        maxItemsInEachRow = columns,
+                        horizontalArrangement = Arrangement.spacedBy(SOURCE_CARD_GAP),
+                        verticalArrangement = Arrangement.spacedBy(SOURCE_CARD_GAP),
                     ) {
-                        sources.forEachIndexed { index, _ ->
+                        displayOrder.forEach { index ->
+                            val source = sources[index]
                             SourceChip(
-                                label = "源${index + 1}",
+                                source = source,
+                                sourceNumber = index + 1,
+                                width = cardWidth,
+                                height = cardHeight,
                                 selected = index == currentSource,
                                 focusedAsSource = index == focusedSource,
-                                requestInitialFocus = index == currentSource,
+                                requestInitialFocus = index == initialCurrentSource,
                                 onFocused = {
                                     focusedSource = index
-                                    if (index != currentSource) onSelectSource(index)
                                 },
-                                onConfirm = onClose,
+                                onConfirm = {
+                                    if (index != currentSource) onSelectSource(index)
+                                    onClose()
+                                },
                             )
                         }
                     }
@@ -852,7 +950,10 @@ private fun SourceSelectorPanel(
 
 @Composable
 private fun SourceChip(
-    label: String,
+    source: StreamSource,
+    sourceNumber: Int,
+    width: androidx.compose.ui.unit.Dp,
+    height: androidx.compose.ui.unit.Dp,
     selected: Boolean,
     focusedAsSource: Boolean,
     requestInitialFocus: Boolean,
@@ -866,8 +967,8 @@ private fun SourceChip(
     }
     Box(
         modifier = Modifier
-            .width(72.dp)
-            .height(32.dp)
+            .width(width)
+            .height(height)
             .onFocusChanged {
                 focused = it.isFocused
                 if (it.isFocused) onFocused()
@@ -881,29 +982,152 @@ private fun SourceChip(
                 shape = RoundedCornerShape(7.dp)
             }
             .background(
-                if (focused || selected || focusedAsSource) TvAccent else TvChipFill,
+                when {
+                    focused || focusedAsSource -> TvAccent
+                    selected -> TvPlayingFill
+                    else -> TvChipFill
+                },
                 RoundedCornerShape(7.dp),
             )
             .clickable(onClick = onConfirm)
             .onPreviewKeyEvent {
                 if (it.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
                 when (it.nativeKeyEvent.keyCode) {
-                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { onConfirm(); true }
+                    in CONFIRM_KEY_CODES -> {
+                        if (it.nativeKeyEvent.repeatCount == 0) onConfirm()
+                        true
+                    }
                     else -> false
                 }
             },
-        contentAlignment = Alignment.Center,
+        contentAlignment = Alignment.CenterStart,
     ) {
-        Text(
-            label,
-            modifier = Modifier.padding(horizontal = 8.dp),
-            fontSize = 11.sp,
-            color = if (selected || focused || focusedAsSource) TvAccentText else Color.White,
-            fontWeight = if (selected || focused || focusedAsSource) FontWeight.SemiBold else FontWeight.Normal,
-            maxLines = 1,
-        )
+        val active = focused || focusedAsSource
+        val quality = SourceQualityPolicy.evaluate(source)
+        val compact = height < 72.dp
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = if (compact) 3.dp else 4.dp),
+            verticalArrangement = Arrangement.spacedBy(0.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "源$sourceNumber",
+                    modifier = Modifier.weight(1f),
+                    fontSize = 12.sp,
+                    lineHeight = 14.sp,
+                    color = if (active) TvAccentText else Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                )
+                if (selected) {
+                    Text(
+                        "当前",
+                        fontSize = 9.sp,
+                        lineHeight = 11.sp,
+                        color = if (active) TvAccentText else TvAccent,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+            Text(
+                sourceVideoFormatText(source, quality.age),
+                color = if (active) TvAccentText.copy(alpha = 0.82f) else TvSoftText,
+                fontSize = 9.sp,
+                lineHeight = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                sourceHealthText(source, quality.age),
+                color = if (active) TvAccentText else sourceHealthColor(quality.healthStatus),
+                fontSize = 9.sp,
+                lineHeight = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                "错误 ${quality.errorCount} · 波动 ${quality.fluctuationCount}",
+                color = if (active) TvAccentText.copy(alpha = 0.72f) else TvMutedText,
+                fontSize = 8.sp,
+                lineHeight = 10.sp,
+                maxLines = 1,
+            )
+        }
     }
 }
+
+private fun rankedSourceIndices(sources: List<StreamSource>, currentSource: Int): List<Int> =
+    sources.map { SourceQualityPolicy.evaluate(it) }.let { quality -> sources.indices.sortedWith(
+        compareBy<Int> {
+            when {
+                it == currentSource -> -1
+                quality[it].healthStatus == SourceHealthStatus.SUCCESS -> 0
+                quality[it].healthStatus == SourceHealthStatus.UNKNOWN -> 1
+                else -> 2
+            }
+        }
+            .thenBy {
+                sources[it].startupMs
+                    ?.takeIf { _ -> quality[it].healthStatus == SourceHealthStatus.SUCCESS }
+                    ?: Long.MAX_VALUE
+            }
+            .thenByDescending {
+                sources[it].bitrateBps
+                    ?.takeIf { _ -> quality[it].healthStatus == SourceHealthStatus.SUCCESS }
+                    ?: Long.MIN_VALUE
+            }
+            .thenBy { quality[it].errorCount }
+            .thenBy { quality[it].fluctuationCount }
+            .thenBy { it },
+    ) }
+
+private fun sourceHealthText(source: StreamSource, age: SourceQualityAge): String {
+    if (age == SourceQualityAge.EXPIRED) {
+        return if (source.lastCheckedAt == null) "未检测" else "待复检 · 记录已过期"
+    }
+    if (age == SourceQualityAge.HISTORICAL && source.healthStatus != SourceHealthStatus.SUCCESS) {
+        return "待复检"
+    }
+    return when (source.healthStatus) {
+        SourceHealthStatus.UNKNOWN -> "未检测"
+        SourceHealthStatus.TIMEOUT -> "加载超时"
+        SourceHealthStatus.ERROR -> "播放失败"
+        SourceHealthStatus.SUCCESS -> buildString {
+            append(if (age == SourceQualityAge.HISTORICAL) "历史可用" else "可用")
+            source.startupMs?.let { append(" ${formatDuration(it)}") }
+            source.bitrateBps?.takeIf { it > 0L }?.let {
+                append(" · ${String.format(Locale.US, "%.1f", it / 1_000_000.0)} Mbps")
+            }
+        }
+    }
+}
+
+private fun sourceVideoFormatText(source: StreamSource, age: SourceQualityAge): String {
+    val width = source.videoWidth ?: return "画质未识别"
+    val height = source.videoHeight ?: return "画质未识别"
+    val detail = buildList {
+        add("${width}×$height")
+        source.videoFrameRate?.takeIf { it > 0f }?.let { frameRate ->
+            val value = if (frameRate % 1f < 0.05f) {
+                frameRate.toInt().toString()
+            } else {
+                String.format(Locale.US, "%.1f", frameRate)
+            }
+            add("${value}fps")
+        }
+        source.videoCodec.takeIf(String::isNotBlank)?.let(::add)
+    }.joinToString(" · ")
+    return if (age == SourceQualityAge.EXPIRED) "历史画质 · $detail" else detail
+}
+
+private fun sourceHealthColor(status: SourceHealthStatus): Color = when (status) {
+    SourceHealthStatus.SUCCESS -> TvAccent
+    SourceHealthStatus.TIMEOUT, SourceHealthStatus.ERROR -> TvError
+    SourceHealthStatus.UNKNOWN -> TvMutedText
+}
+
+private fun formatDuration(millis: Long): String =
+    if (millis < 1_000L) "${millis}ms" else String.format(Locale.US, "%.1f秒", millis / 1_000.0)
 
 @Composable
 private fun ProgramRow(program: com.youtv.app.domain.model.Program, selected: Boolean, nowMillis: Long) {
@@ -972,19 +1196,39 @@ private fun ProgramRow(program: com.youtv.app.domain.model.Program, selected: Bo
 }
 
 @Composable
-private fun ChannelLogo(url: String, modifier: Modifier = Modifier, cornerRadius: Int) {
+private fun ChannelLogo(name: String, url: String, modifier: Modifier = Modifier, cornerRadius: Int) {
+    val localLogo = remember(name) { ChannelLogoCatalog.drawableFor(name) }
     var failed by remember(url) { mutableStateOf(false) }
-    if (url.isBlank() || failed) return
-    AsyncImage(
-        model = url,
-        contentDescription = null,
-        contentScale = ContentScale.Fit,
-        onError = { failed = true },
+    Box(
         modifier = modifier
             .clip(RoundedCornerShape(cornerRadius.dp))
             .background(TvLogoBackdrop, RoundedCornerShape(cornerRadius.dp))
             .padding(2.dp),
-    )
+        contentAlignment = Alignment.Center,
+    ) {
+        when {
+            localLogo != null -> Image(
+                painter = painterResource(localLogo),
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+            )
+            url.isNotBlank() && !failed -> AsyncImage(
+                model = url,
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                onError = { failed = true },
+                modifier = Modifier.fillMaxSize(),
+            )
+            else -> Text(
+                text = name.trim().take(2).ifBlank { "TV" }.uppercase(Locale.ROOT),
+                color = TvSoftText,
+                fontSize = 8.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+            )
+        }
+    }
 }
 
 @Composable
@@ -1035,7 +1279,10 @@ private fun DetailText(value: String) {
 private fun InfoPanel(title: String, body: String, alignment: Alignment) {
     Box(Modifier.fillMaxSize(), contentAlignment = alignment) {
         Surface(
-            modifier = Modifier.width(520.dp).padding(32.dp),
+            modifier = Modifier
+                .widthIn(max = 520.dp)
+                .fillMaxWidth(0.86f)
+                .padding(24.dp),
             color = TvGlassPanel,
             shape = RoundedCornerShape(14.dp),
         ) {
@@ -1051,6 +1298,7 @@ private fun InfoPanel(title: String, body: String, alignment: Alignment) {
 private data class VolumeUi(val current: Int, val maximum: Int, val eventId: Long)
 
 private val TvAccent = Color(0xFF00FFCC)
+private val TvError = Color(0xFFFF8066)
 private val TvAccentText = Color(0xFF07120F)
 private val TvGlassPanel = Color(0xD92E3337)
 private val TvGlassStrong = Color(0xE6262B2F)
@@ -1069,3 +1317,16 @@ private val TvLogoBackdrop = Color(0x1FFFFFFF)
 private const val CHANNEL_NUMBER_DELAY_MILLIS = 1_500L
 private const val VOLUME_DISPLAY_MILLIS = 2_000L
 private const val MESSAGE_DISPLAY_MILLIS = 3_000L
+private val CONFIRM_KEY_CODES = setOf(
+    KeyEvent.KEYCODE_DPAD_CENTER,
+    KeyEvent.KEYCODE_ENTER,
+    KeyEvent.KEYCODE_NUMPAD_ENTER,
+    KeyEvent.KEYCODE_BUTTON_A,
+    KeyEvent.KEYCODE_BUTTON_SELECT,
+)
+private const val MAX_VISIBLE_SOURCES = 20
+private const val MAX_SOURCE_COLUMNS = 5
+private val SOURCE_CARD_WIDTH = 180.dp
+private val SOURCE_CARD_HEIGHT = 88.dp
+private val SOURCE_CARD_GAP = 8.dp
+private val SOURCE_LAYOUT_TOLERANCE = 2.dp

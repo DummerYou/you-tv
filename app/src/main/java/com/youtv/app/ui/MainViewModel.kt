@@ -12,6 +12,7 @@ import com.youtv.app.domain.model.Channel
 import com.youtv.app.domain.model.ChannelGroup
 import com.youtv.app.domain.model.EpgGuide
 import com.youtv.app.domain.model.Program
+import com.youtv.app.domain.model.SourcePlaybackResult
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -139,6 +140,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return false
     }
 
+    fun toggleInfo() {
+        if (infoVisible.value) {
+            infoHideJob?.cancel()
+            infoVisible.value = false
+        } else {
+            showInfo()
+        }
+    }
+
     fun selectChannel(channel: Channel) {
         val index = state.value.channels.indexOfFirst { it.id == channel.id }
         if (index >= 0) {
@@ -173,8 +183,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun rememberSuccessfulSource(channelId: String, sourceIndex: Int) {
-        viewModelScope.launch { repository.rememberSuccessfulSource(channelId, sourceIndex) }
+    fun rememberSourceResult(result: SourcePlaybackResult) {
+        viewModelScope.launch { repository.rememberSourceResult(result) }
     }
 
     fun setChannelReversal(value: Boolean) = viewModelScope.launch {
@@ -413,38 +423,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val candidate = key.normalizedChannelName()
             name.contains(candidate) || candidate.contains(name)
         }?.value.orEmpty()
-        return epgLogo.ifBlank { fallbackLogoFor(channelName) }
+        return epgLogo
     }
 
     private fun String.normalizedChannelName(): String =
         lowercase()
             .replace(Regex("""[^\p{IsHan}a-z0-9]+"""), "")
 
-    private fun fallbackLogoFor(channelName: String): String {
-        val compact = channelName.uppercase()
-            .replace("CCTV-", "CCTV")
-            .replace("CCTV ", "CCTV")
-        val key = when {
-            "CCTV5+" in compact -> "CCTV5+"
-            "CCTV4K" in compact -> "CCTV4K"
-            else -> Regex("""CCTV(\d{1,2})""").find(compact)?.value
-                ?: COMMON_LOGO_NAMES.firstOrNull { channelName.normalizedChannelName().contains(it.normalizedChannelName()) }
-        } ?: return ""
-        return "https://live.fanmingming.com/tv/$key.png"
-    }
-
     private companion object {
         const val INFO_DISPLAY_MILLIS = 5_000L
         const val ACTIVE_PLAYLIST_FILE = "channels.txt"
         const val TEXT_PLAYLIST_FILE = "playlist-text.txt"
         const val URL_PLAYLIST_FILE = "playlist-url.txt"
-        val COMMON_LOGO_NAMES = listOf(
-            "CGTN", "湖南卫视", "浙江卫视", "江苏卫视", "东方卫视", "北京卫视",
-            "广东卫视", "深圳卫视", "安徽卫视", "山东卫视", "河南卫视", "湖北卫视",
-            "四川卫视", "重庆卫视", "东南卫视", "江西卫视", "辽宁卫视", "天津卫视",
-            "河北卫视", "黑龙江卫视", "吉林卫视", "广西卫视", "云南卫视", "贵州卫视",
-            "海南卫视", "青海卫视", "甘肃卫视", "宁夏卫视", "新疆卫视", "西藏卫视",
-            "内蒙古卫视", "兵团卫视", "金鹰卡通", "卡酷少儿", "炫动卡通",
-        )
     }
 }

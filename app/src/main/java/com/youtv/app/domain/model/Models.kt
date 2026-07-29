@@ -7,11 +7,57 @@ enum class SourceAddressType {
     UNKNOWN,
 }
 
+enum class SourceHealthStatus {
+    UNKNOWN,
+    SUCCESS,
+    TIMEOUT,
+    ERROR,
+}
+
+enum class SourcePlaybackEventType {
+    ATTEMPT_STARTED,
+    SUCCESS,
+    TIMEOUT,
+    ERROR,
+    FLUCTUATION,
+    FORMAT_CHANGED,
+}
+
 data class StreamSource(
     val url: String,
     val headers: Map<String, String> = emptyMap(),
     val order: Int = 0,
     val addressType: SourceAddressType = SourceAddressClassifier.classify(url),
+    val healthStatus: SourceHealthStatus = SourceHealthStatus.UNKNOWN,
+    val startupMs: Long? = null,
+    val bitrateBps: Long? = null,
+    val lastCheckedAt: Long? = null,
+    val firstSeenAt: Long = 0L,
+    val lastAttemptAt: Long? = null,
+    val lastErrorAt: Long? = null,
+    val lastFluctuationAt: Long? = null,
+    val errorCount: Int = 0,
+    val fluctuationCount: Int = 0,
+    val videoWidth: Int? = null,
+    val videoHeight: Int? = null,
+    val videoFrameRate: Float? = null,
+    val videoCodec: String = "",
+    val videoTrackBitrate: Long? = null,
+)
+
+data class SourcePlaybackResult(
+    val channelId: String,
+    val sourceUrl: String,
+    val sourceIndex: Int,
+    val event: SourcePlaybackEventType,
+    val startupMs: Long? = null,
+    val bitrateBps: Long? = null,
+    val videoWidth: Int? = null,
+    val videoHeight: Int? = null,
+    val videoFrameRate: Float? = null,
+    val videoCodec: String = "",
+    val videoTrackBitrate: Long? = null,
+    val checkedAt: Long = System.currentTimeMillis(),
 )
 
 data class Channel(

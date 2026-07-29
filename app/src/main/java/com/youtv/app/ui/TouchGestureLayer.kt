@@ -193,7 +193,7 @@ private class GestureTracking {
     }
 }
 
-private const val CHANNEL_ZONE_FRACTION = 0.75f
+private const val CHANNEL_ZONE_FRACTION = 0.5f
 private const val LONG_PRESS_LEFT_FRACTION = 0.5f
 private const val CHANNEL_SWIPE_FRACTION = 0.15f
 private const val DIRECTION_RATIO = 1.2f

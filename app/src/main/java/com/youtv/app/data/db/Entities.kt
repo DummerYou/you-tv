@@ -31,6 +31,7 @@ data class ChannelEntity(
     val sortOrder: Int,
     val favorite: Boolean = false,
     val lastSuccessfulSource: Int = 0,
+    val lastSuccessfulSourceUrl: String = "",
 )
 
 @Entity(
@@ -50,4 +51,19 @@ data class StreamSourceEntity(
     val url: String,
     val headersJson: String,
     val addressType: String,
+    val healthStatus: String = "UNKNOWN",
+    val startupMs: Long? = null,
+    val bitrateBps: Long? = null,
+    val lastCheckedAt: Long? = null,
+    val firstSeenAt: Long = 0L,
+    val lastAttemptAt: Long? = null,
+    val lastErrorAt: Long? = null,
+    val lastFluctuationAt: Long? = null,
+    val errorCount: Int = 0,
+    val fluctuationCount: Int = 0,
+    val videoWidth: Int? = null,
+    val videoHeight: Int? = null,
+    val videoFrameRate: Float? = null,
+    val videoCodec: String = "",
+    val videoTrackBitrate: Long? = null,
 )

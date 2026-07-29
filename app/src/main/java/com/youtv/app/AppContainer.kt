@@ -19,7 +19,9 @@ class AppContainer(context: Context) {
     private val appContext = context.applicationContext
     private val gson = Gson()
     val legacyPreferences = LegacyPreferences(appContext)
-    private val database = Room.databaseBuilder(appContext, AppDatabase::class.java, "my-tv.db").build()
+    private val database = Room.databaseBuilder(appContext, AppDatabase::class.java, "my-tv.db")
+        .addMigrations(AppDatabase.MIGRATION_1_2)
+        .build()
     private val dataStore: DataStore<Preferences> = PreferenceDataStoreFactory.create(
         migrations = listOf(SharedPreferencesMigration(appContext, appContext.getString(R.string.app_name))),
         produceFile = { appContext.preferencesDataStoreFile("settings") },

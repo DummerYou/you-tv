@@ -88,11 +88,10 @@ fun getVersionCode(): Int {
 }
 
 fun getVersionName(): String {
-    return getTag().ifEmpty {
-        val metadata = rootProject.file("version.json").takeIf { it.exists() }?.readText().orEmpty()
-        Regex("\"version_name\"\\s*:\\s*\"v?([^\"]+)\"").find(metadata)?.groupValues?.get(1)
-            ?: "1.0.0"
-    }
+    val metadata = rootProject.file("version.json").takeIf { it.exists() }?.readText().orEmpty()
+    Regex("\"version_name\"\\s*:\\s*\"v?([^\"]+)\"").find(metadata)?.groupValues?.get(1)
+        ?.let { return it }
+    return getTag().ifEmpty { "1.0.0" }
 }
 
 dependencies {
