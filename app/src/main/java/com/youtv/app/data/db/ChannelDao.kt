@@ -64,6 +64,9 @@ interface ChannelDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertQualities(qualities: List<SourceQualityEntity>)
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertQualityIfMissing(quality: SourceQualityEntity)
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertBlockedSource(source: BlockedSourceEntity)
 
@@ -84,6 +87,16 @@ interface ChannelDao {
 
     @Query("UPDATE channels SET lastSuccessfulSource = :sourceIndex, lastSuccessfulSourceUrl = :sourceUrl WHERE id = :channelId")
     suspend fun setLastSuccessfulSource(channelId: String, sourceIndex: Int, sourceUrl: String)
+
+    @Query(
+        """UPDATE source_quality SET sourceUrl = :sourceKey
+            WHERE channelId = :channelId AND sourceUrl = :legacyUrl
+              AND NOT EXISTS (
+                  SELECT 1 FROM source_quality AS existing
+                  WHERE existing.channelId = :channelId AND existing.sourceUrl = :sourceKey
+              )""",
+    )
+    suspend fun migrateLegacyQualityKey(channelId: String, legacyUrl: String, sourceKey: String)
 
     @Query(
         "UPDATE source_quality SET lastAttemptAt = :attemptedAt WHERE channelId = :channelId AND sourceUrl = :sourceUrl",
@@ -170,9 +183,21 @@ interface ChannelDao {
 
     @Query(
         """UPDATE source_quality SET
-            totalPlaybackMs = totalPlaybackMs + :playbackMs,
-            totalBufferingMs = totalBufferingMs + :bufferingMs,
-            sessionCount = sessionCount + :sessionIncrement
+            totalPlaybackMs = CASE
+                WHEN totalPlaybackMs + totalBufferingMs >= 43200000
+                    THEN totalPlaybackMs / 2 + :playbackMs
+                ELSE totalPlaybackMs + :playbackMs
+            END,
+            totalBufferingMs = CASE
+                WHEN totalPlaybackMs + totalBufferingMs >= 43200000
+                    THEN totalBufferingMs / 2 + :bufferingMs
+                ELSE totalBufferingMs + :bufferingMs
+            END,
+            sessionCount = CASE
+                WHEN totalPlaybackMs + totalBufferingMs >= 43200000
+                    THEN sessionCount / 2 + :sessionIncrement
+                ELSE sessionCount + :sessionIncrement
+            END
             WHERE channelId = :channelId AND sourceUrl = :sourceUrl""",
     )
     suspend fun addSourceSessionStats(

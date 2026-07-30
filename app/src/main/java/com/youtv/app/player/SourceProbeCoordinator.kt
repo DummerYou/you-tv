@@ -1,6 +1,7 @@
 package com.youtv.app.player
 
 import com.youtv.app.domain.model.Channel
+import com.youtv.app.domain.model.SourceIdentity
 import com.youtv.app.domain.model.StreamSource
 import com.youtv.app.requests.HttpClient
 import java.net.ConnectException
@@ -83,7 +84,7 @@ class SourceProbeCoordinator {
     fun bestSuccessfulCandidate(channel: Channel, candidates: List<Int>): Int? {
         val now = nowMillis()
         return candidates.mapNotNull { index ->
-            val result = cache[channel.sources[index].url]
+            val result = cache[SourceIdentity.fingerprint(channel.sources[index])]
                 ?.takeIf { it.success && it.expiresAt > now }
                 ?: return@mapNotNull null
             Triple(index, result.latencyMs, result.throughputBps)
@@ -110,7 +111,9 @@ class SourceProbeCoordinator {
                 val url = source.url.toHttpUrlOrNull() ?: return@forEach
                 if (url.scheme !in HTTP_SCHEMES || !selectedHosts.add(url.host)) return@forEach
                 if ((hostCooldown[url.host] ?: 0L) > now) return@forEach
-                if (cache[source.url]?.expiresAt?.let { it > now } == true) return@forEach
+                if (cache[SourceIdentity.fingerprint(source)]?.expiresAt?.let { it > now } == true) {
+                    return@forEach
+                }
                 add(index)
             }
         }
@@ -119,6 +122,7 @@ class SourceProbeCoordinator {
     private suspend fun probeAndCache(source: StreamSource) {
         val startedAt = nowMillis()
         val url = source.url.toHttpUrlOrNull() ?: return
+        val cacheKey = SourceIdentity.fingerprint(source)
         var transferredBytes = 0L
         try {
             withTimeout(PROBE_TIMEOUT_MILLIS) {
@@ -148,7 +152,7 @@ class SourceProbeCoordinator {
                 }
             }
             val elapsed = (nowMillis() - startedAt).coerceAtLeast(1L)
-            cache[source.url] = ProbeResult(
+            cache[cacheKey] = ProbeResult(
                 success = true,
                 latencyMs = elapsed,
                 throughputBps = transferredBytes * 8_000L / elapsed,
@@ -157,7 +161,7 @@ class SourceProbeCoordinator {
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
-            cache[source.url] = ProbeResult(
+            cache[cacheKey] = ProbeResult(
                 success = false,
                 latencyMs = nowMillis() - startedAt,
                 throughputBps = 0L,

@@ -58,7 +58,8 @@ class ChannelRepository(
                         }
                     }
                     val preferredSource = sources.indexOfFirst {
-                        it.url == item.channel.lastSuccessfulSourceUrl
+                        SourceIdentity.fingerprint(it) == item.channel.lastSuccessfulSourceUrl ||
+                            it.url == item.channel.lastSuccessfulSourceUrl
                     }.takeIf { it >= 0 } ?: 0
                     Channel(
                         id = item.channel.id,
@@ -85,7 +86,8 @@ class ChannelRepository(
 
     fun applyQuality(channel: Channel, quality: Map<String, SourceQualityEntity>): Channel =
         channel.copy(sources = channel.sources.map { source ->
-            quality[source.url]?.let { source.withQuality(it) } ?: source
+            (quality[SourceIdentity.fingerprint(source)] ?: quality[source.url])
+                ?.let { source.withQuality(it) } ?: source
         })
 
     suspend fun importPlaylist(
@@ -110,12 +112,14 @@ class ChannelRepository(
                 val previousChannel = previous[channel.id]
                 val oldSources = previousSources[channel.id].orEmpty()
                 val oldQualities = previousQualities[channel.id].orEmpty()
-                val rememberedUrl = previousChannel?.lastSuccessfulSourceUrl
+                val rememberedKey = previousChannel?.lastSuccessfulSourceUrl
                     ?.takeIf(String::isNotBlank)
                     ?: oldSources.firstOrNull {
                         it.sortOrder == previousChannel?.lastSuccessfulSource
                     }?.url
-                val preferredSource = channel.sources.indexOfFirst { it.url == rememberedUrl }
+                val preferredSource = channel.sources.indexOfFirst {
+                    SourceIdentity.fingerprint(it) == rememberedKey || it.url == rememberedKey
+                }
                     .takeIf { it >= 0 }
                     ?: 0
                 channelEntities += ChannelEntity(
@@ -129,11 +133,14 @@ class ChannelRepository(
                     favorite = previous[channel.id]?.favorite
                         ?: (migrateLegacyFavorites && legacyIndex in legacyFavoriteIndexes),
                     lastSuccessfulSource = preferredSource,
-                    lastSuccessfulSourceUrl = channel.sources.getOrNull(preferredSource)?.url.orEmpty(),
+                    lastSuccessfulSourceUrl = channel.sources.getOrNull(preferredSource)
+                        ?.let(SourceIdentity::fingerprint).orEmpty(),
                 )
                 channel.sources.forEach { source ->
                     val previousSource = oldSources.firstOrNull { it.url == source.url }
-                    val previousQuality = oldQualities.firstOrNull { it.sourceUrl == source.url }
+                    val sourceKey = SourceIdentity.fingerprint(source)
+                    val previousQuality = oldQualities.firstOrNull { it.sourceUrl == sourceKey }
+                        ?: oldQualities.firstOrNull { it.sourceUrl == source.url }
                     val firstSeenAt = previousQuality?.firstSeenAt?.takeIf { it > 0L }
                         ?: previousSource?.firstSeenAt?.takeIf { it > 0L }
                         ?: importedAt
@@ -150,12 +157,12 @@ class ChannelRepository(
                         addressType = source.addressType.name,
                     )
                     qualityEntities += if (clearHistory) {
-                        SourceQualityEntity(channel.id, source.url, firstSeenAt = firstSeenAt)
+                        SourceQualityEntity(channel.id, sourceKey, firstSeenAt = firstSeenAt)
                     } else {
-                        previousQuality?.copy(channelId = channel.id, sourceUrl = source.url)
+                        previousQuality?.copy(channelId = channel.id, sourceUrl = sourceKey)
                             ?: SourceQualityEntity(
                                 channelId = channel.id,
-                                sourceUrl = source.url,
+                                sourceUrl = sourceKey,
                                 healthStatus = previousSource?.healthStatus ?: SourceHealthStatus.UNKNOWN.name,
                                 startupMs = previousSource?.startupMs,
                                 bitrateBps = previousSource?.bitrateBps,
@@ -207,10 +214,18 @@ class ChannelRepository(
     suspend fun clearBlockedSources() = dao.clearBlockedSources()
 
     suspend fun rememberSourceResult(result: SourcePlaybackResult) {
+        dao.migrateLegacyQualityKey(result.channelId, result.sourceUrl, result.sourceKey)
+        dao.insertQualityIfMissing(
+            SourceQualityEntity(
+                channelId = result.channelId,
+                sourceUrl = result.sourceKey,
+                firstSeenAt = result.checkedAt,
+            ),
+        )
         if (result.event == SourcePlaybackEventType.ATTEMPT_STARTED) {
             dao.markSourceAttempted(
                 channelId = result.channelId,
-                sourceUrl = result.sourceUrl,
+                sourceUrl = result.sourceKey,
                 attemptedAt = result.checkedAt,
             )
             return
@@ -218,7 +233,7 @@ class ChannelRepository(
         if (result.event == SourcePlaybackEventType.FLUCTUATION) {
             dao.incrementSourceFluctuation(
                 channelId = result.channelId,
-                sourceUrl = result.sourceUrl,
+                sourceUrl = result.sourceKey,
                 checkedAt = result.checkedAt,
             )
             return
@@ -226,7 +241,7 @@ class ChannelRepository(
         if (result.event == SourcePlaybackEventType.FORMAT_CHANGED) {
             dao.setSourceFormat(
                 channelId = result.channelId,
-                sourceUrl = result.sourceUrl,
+                sourceUrl = result.sourceKey,
                 videoWidth = result.videoWidth,
                 videoHeight = result.videoHeight,
                 videoFrameRate = result.videoFrameRate,
@@ -239,7 +254,7 @@ class ChannelRepository(
         if (result.event == SourcePlaybackEventType.SESSION_STATS) {
             dao.addSourceSessionStats(
                 channelId = result.channelId,
-                sourceUrl = result.sourceUrl,
+                sourceUrl = result.sourceKey,
                 playbackMs = result.playbackMs,
                 bufferingMs = result.bufferingMs,
                 sessionIncrement = result.sessionIncrement,
@@ -257,7 +272,7 @@ class ChannelRepository(
         }
         dao.setSourceHealth(
             channelId = result.channelId,
-            sourceUrl = result.sourceUrl,
+            sourceUrl = result.sourceKey,
             status = status.name,
             startupMs = result.startupMs,
             bitrateBps = result.bitrateBps,
@@ -270,7 +285,7 @@ class ChannelRepository(
             videoTrackBitrate = result.videoTrackBitrate,
         )
         if (status == SourceHealthStatus.SUCCESS) {
-            dao.setLastSuccessfulSource(result.channelId, result.sourceIndex, result.sourceUrl)
+            dao.setLastSuccessfulSource(result.channelId, result.sourceIndex, result.sourceKey)
         }
     }
 
@@ -291,6 +306,7 @@ class ChannelRepository(
         videoFrameRate = quality.videoFrameRate,
         videoCodec = quality.videoCodec,
         videoTrackBitrate = quality.videoTrackBitrate,
+        formatCheckedAt = quality.formatCheckedAt,
         totalPlaybackMs = quality.totalPlaybackMs,
         totalBufferingMs = quality.totalBufferingMs,
         sessionCount = quality.sessionCount,

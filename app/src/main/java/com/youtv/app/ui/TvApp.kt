@@ -1185,6 +1185,7 @@ private fun SourceChip(
     ) {
         val active = focused || focusedAsSource
         val quality = SourceQualityPolicy.evaluate(source)
+        val formatAge = SourceQualityPolicy.qualityAge(source.formatCheckedAt)
         val compact = height < 72.dp
         Column(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = if (compact) 3.dp else 4.dp),
@@ -1219,7 +1220,7 @@ private fun SourceChip(
                 }
             }
             Text(
-                sourceVideoFormatText(source, quality.age),
+                sourceVideoFormatText(source, formatAge),
                 color = if (active) TvAccentText.copy(alpha = 0.82f) else TvSoftText,
                 fontSize = 9.sp,
                 lineHeight = 11.sp,

@@ -58,6 +58,38 @@ class SourceProbeCoordinatorTest {
         }
     }
 
+    @Test
+    fun sameUrlWithDifferentHeadersDoesNotShareProbeCache() {
+        val hits = AtomicInteger()
+        TestHttpServer().use { server ->
+            server.respond("/headers") {
+                hits.incrementAndGet()
+                ByteArray(4096) { 0x47 }
+            }
+            val url = "http://127.0.0.1:${server.port}/headers"
+            val channel = Channel(
+                id = "headers",
+                name = "headers",
+                sources = listOf(
+                    StreamSource("http://127.0.0.1:1/current"),
+                    StreamSource(url, headers = mapOf("Token" to "a")),
+                    StreamSource(url, headers = mapOf("Token" to "b")),
+                ),
+            )
+            val coordinator = SourceProbeCoordinator()
+            try {
+                coordinator.schedule(channel, 0, listOf(1), delayMillis = 0)
+                assertTrue(waitUntil { coordinator.bestSuccessfulCandidate(channel, listOf(1)) == 1 })
+                assertEquals(null, coordinator.bestSuccessfulCandidate(channel, listOf(2)))
+                coordinator.schedule(channel, 0, listOf(2), delayMillis = 0)
+                assertTrue(waitUntil { coordinator.bestSuccessfulCandidate(channel, listOf(2)) == 2 })
+                assertEquals(2, hits.get())
+            } finally {
+                coordinator.release()
+            }
+        }
+    }
+
     private fun channelFor(server: TestHttpServer, path: String): Channel = Channel(
         id = "test",
         name = "test",

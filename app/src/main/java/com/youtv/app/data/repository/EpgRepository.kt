@@ -3,6 +3,7 @@ package com.youtv.app.data.repository
 import android.content.Context
 import com.youtv.app.domain.epg.EpgParser
 import com.youtv.app.domain.model.EpgGuide
+import com.youtv.app.domain.model.EpgChannelLookup
 import com.youtv.app.domain.model.Program
 import com.youtv.app.requests.HttpClient
 import kotlinx.coroutines.Dispatchers
@@ -59,10 +60,7 @@ class EpgRepository(context: Context) {
     }
 
     fun programsFor(channelName: String): List<Program> {
-        val name = channelName.lowercase()
-        return _guide.value.programs.entries.firstOrNull { (key, _) ->
-            name.contains(key.lowercase(), ignoreCase = true)
-        }?.value.orEmpty()
+        return EpgChannelLookup(_guide.value).programsFor(channelName)
     }
 
     private companion object {

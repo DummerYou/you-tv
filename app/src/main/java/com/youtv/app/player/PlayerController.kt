@@ -29,6 +29,7 @@ import com.youtv.app.domain.model.Channel
 import com.youtv.app.domain.model.SourceAddressType
 import com.youtv.app.domain.model.SourcePlaybackEventType
 import com.youtv.app.domain.model.SourcePlaybackResult
+import com.youtv.app.domain.model.SourceIdentity
 import com.youtv.app.domain.model.SourceSelectionPolicy
 import com.youtv.app.domain.model.StreamSource
 import com.youtv.app.requests.HttpClient
@@ -115,13 +116,18 @@ class PlayerController(
     private var firstFrameTimeoutJob: Job? = null
     private var rebufferTimeoutJob: Job? = null
     private var recoveryJob: Job? = null
+    private var sessionCheckpointJob: Job? = null
     private var recoveryAttempt = 0
+    private val attemptLedger = PlaybackAttemptLedger()
 
     fun play(channel: Channel, preferredSource: Int = 0) {
         if (released) return
         cancelRecovery(reset = true)
+        flushSessionStats()
+        currentChannel = channel
         if (channel.sources.isEmpty()) {
             cancelTimeouts()
+            cancelSessionCheckpoint()
             attemptGate.invalidate()
             activeAttempt = null
             player.stop()
@@ -130,11 +136,8 @@ class PlayerController(
             )
             return
         }
-        flushSessionStats()
-        currentChannel = channel
         val preferred = preferredSource.coerceIn(channel.sources.indices)
-        attemptOrder = buildAttemptOrder(channel, preferred, forced = null)
-        attemptPosition = 0
+        beginAttemptRound(channel, preferred, forced = null)
         startCurrentSourceAttempt()
     }
 
@@ -144,8 +147,7 @@ class PlayerController(
         cancelRecovery(reset = true)
         val selected = index.coerceIn(channel.sources.indices)
         flushSessionStats()
-        attemptOrder = buildAttemptOrder(channel, selected, forced = selected)
-        attemptPosition = 0
+        beginAttemptRound(channel, selected, forced = selected)
         startCurrentSourceAttempt()
     }
 
@@ -154,25 +156,25 @@ class PlayerController(
         if (channel.sources.isEmpty()) return
         cancelRecovery(reset = true)
         flushSessionStats()
-        attemptOrder = buildAttemptOrder(
-            channel,
-            sourceIndex.coerceIn(channel.sources.indices),
-            forced = null,
-        )
-        attemptPosition = 0
+        beginAttemptRound(channel, sourceIndex.coerceIn(channel.sources.indices), forced = null)
         startCurrentSourceAttempt()
     }
 
     fun updateChannelSnapshot(channel: Channel) {
         val previous = currentChannel ?: return
         if (previous.id != channel.id) return
-        val activeUrl = previous.sources.getOrNull(sourceIndex)?.url
-        val replacementIndex = activeUrl?.let { url -> channel.sources.indexOfFirst { it.url == url } } ?: -1
+        val previousRemaining = attemptOrder.drop(attemptPosition + 1)
+        val activeFingerprint = previous.sources.getOrNull(sourceIndex)
+            ?.let(SourceIdentity::fingerprint)
+        val replacementIndex = activeFingerprint?.let { fingerprint ->
+            channel.sources.indexOfFirst { SourceIdentity.fingerprint(it) == fingerprint }
+        } ?: -1
         if (replacementIndex < 0) {
             flushSessionStats()
             currentChannel = channel
             if (channel.sources.isEmpty()) {
                 cancelTimeouts()
+                cancelSessionCheckpoint()
                 attemptGate.invalidate()
                 activeAttempt = null
                 player.stop()
@@ -181,15 +183,27 @@ class PlayerController(
                 )
                 return
             }
+            cancelTimeouts()
+            attemptGate.invalidate()
+            activeAttempt = null
             attemptOrder = buildAttemptOrder(channel, channel.preferredSource, forced = null)
+                .filterNot { attemptLedger.hasAttempted(channel.sources[it]) }
             attemptPosition = 0
-            startCurrentSourceAttempt()
+            if (attemptOrder.isEmpty()) failAllSources(channel, "所有未屏蔽来源本轮均已尝试")
+            else startCurrentSourceAttempt()
             return
         }
         currentChannel = channel
         sourceIndex = replacementIndex
         activeAttempt = activeAttempt?.copy(channel = channel, sourceIndex = replacementIndex)
-        attemptOrder = buildAttemptOrder(channel, channel.preferredSource, forced = replacementIndex)
+        val rankedCurrent = buildAttemptOrder(channel, channel.preferredSource, forced = null)
+        val remaining = attemptLedger.remapRemaining(
+            previousSources = previous.sources,
+            previousRemainingIndices = previousRemaining,
+            currentSources = channel.sources,
+            rankedCurrentIndices = rankedCurrent,
+        )
+        attemptOrder = listOf(replacementIndex) + remaining
         attemptPosition = 0
     }
 
@@ -200,6 +214,7 @@ class PlayerController(
                 (SystemClock.elapsedRealtime() - sourceAttemptStartedAt)).coerceAtLeast(1L)
         }
         flushSessionStats()
+        cancelSessionCheckpoint()
         cancelTimeouts()
         player.pause()
     }
@@ -221,9 +236,11 @@ class PlayerController(
             scheduleFirstFrameTimeout(channel, attempt.sourceIndex, attempt.token, remaining)
         } else if (_state.value is PlaybackState.Buffering) {
             startBufferingSegment()
+            scheduleSessionCheckpoint()
             scheduleRebufferTimeout(channel, attempt.sourceIndex, attempt.token)
         } else if (renderedFirstFrame) {
             startPlaybackSegment()
+            scheduleSessionCheckpoint()
         }
     }
 
@@ -235,6 +252,7 @@ class PlayerController(
         cancelRecovery(reset = true)
         flushSessionStats()
         cancelTimeouts()
+        cancelSessionCheckpoint()
         attemptGate.invalidate()
         activeAttempt = null
         player.stop()
@@ -247,6 +265,7 @@ class PlayerController(
         flushSessionStats()
         released = true
         cancelTimeouts()
+        cancelSessionCheckpoint()
         attemptGate.invalidate()
         activeAttempt = null
         controllerJob.cancel()
@@ -272,6 +291,12 @@ class PlayerController(
         }.thenBy { ranked.indexOf(it) })
     }
 
+    private fun beginAttemptRound(channel: Channel, preferred: Int, forced: Int?) {
+        attemptLedger.reset()
+        attemptOrder = buildAttemptOrder(channel, preferred, forced)
+        attemptPosition = 0
+    }
+
     private fun startCurrentSourceAttempt() {
         val channel = currentChannel ?: return
         if (attemptPosition !in attemptOrder.indices) {
@@ -279,7 +304,15 @@ class PlayerController(
             return
         }
         cancelTimeouts()
+        cancelSessionCheckpoint()
         sourceIndex = attemptOrder[attemptPosition]
+        val source = channel.sources[sourceIndex]
+        if (attemptLedger.hasAttempted(source)) {
+            attemptPosition++
+            startCurrentSourceAttempt()
+            return
+        }
+        attemptLedger.markAttempted(source)
         sourceTypeIndex = 0
         sourceAttemptStartedAt = SystemClock.elapsedRealtime()
         renderedFirstFrame = false
@@ -296,7 +329,7 @@ class PlayerController(
         _state.value = PlaybackState.Preparing(channel, sourceIndex)
         reportSourceResult(
             channel = channel,
-            source = channel.sources[sourceIndex],
+            source = source,
             event = SourcePlaybackEventType.ATTEMPT_STARTED,
         )
         scheduleCandidateProbes(channel)
@@ -417,13 +450,17 @@ class PlayerController(
 
     private fun failAllSources(channel: Channel, message: String) {
         cancelTimeouts()
+        cancelSessionCheckpoint()
+        sessionStarted = false
+        playbackSegmentStartedAt = 0L
+        bufferingSegmentStartedAt = 0L
         val source = channel.sources.getOrNull(sourceIndex)
         attemptGate.invalidate()
         activeAttempt = null
         player.stop()
         _state.value = PlaybackState.Failed(
             channel = channel,
-            attemptedSources = attemptOrder.size,
+            attemptedSources = attemptLedger.attemptedCount,
             addressType = source?.addressType ?: SourceAddressType.UNKNOWN,
             message = message,
         )
@@ -444,8 +481,7 @@ class PlayerController(
     private fun retryFailedChannel() {
         val channel = currentChannel ?: return
         if (channel.sources.isEmpty() || released) return
-        attemptOrder = buildAttemptOrder(channel, channel.preferredSource, forced = null)
-        attemptPosition = 0
+        beginAttemptRound(channel, channel.preferredSource, forced = null)
         startCurrentSourceAttempt()
     }
 
@@ -471,6 +507,7 @@ class PlayerController(
             SourcePlaybackResult(
                 channelId = channel.id,
                 sourceUrl = source.url,
+                sourceKey = SourceIdentity.fingerprint(source),
                 sourceIndex = resultSourceIndex,
                 event = event,
                 startupMs = startupMs,
@@ -621,6 +658,7 @@ class PlayerController(
             resultSourceIndex = attempt.sourceIndex,
         )
         startPlaybackSegment()
+        scheduleSessionCheckpoint()
         reportSourceResult(
             channel = channel,
             source = source,
@@ -735,6 +773,25 @@ class PlayerController(
 
     private fun mediaIdFor(token: Long): String = "$ATTEMPT_MEDIA_ID_PREFIX$token"
 
+    private fun scheduleSessionCheckpoint() {
+        sessionCheckpointJob?.cancel()
+        sessionCheckpointJob = scope.launch {
+            while (!released && sessionStarted) {
+                delay(SESSION_CHECKPOINT_MILLIS)
+                if (!sessionStarted) break
+                val wasBuffering = bufferingSegmentStartedAt > 0L
+                val wasPlaying = playbackSegmentStartedAt > 0L
+                flushSessionStats()
+                if (wasBuffering) startBufferingSegment() else if (wasPlaying) startPlaybackSegment()
+            }
+        }
+    }
+
+    private fun cancelSessionCheckpoint() {
+        sessionCheckpointJob?.cancel()
+        sessionCheckpointJob = null
+    }
+
     private enum class SourceMode { HLS, DASH, RTSP, RTMP, PROGRESSIVE }
 
     private data class VideoFormatSnapshot(
@@ -755,6 +812,7 @@ class PlayerController(
         const val FIRST_FRAME_TIMEOUT_MILLIS = 5_000L
         const val REBUFFER_TIMEOUT_MILLIS = 8_000L
         const val PROBE_TRIGGER_MILLIS = 2_000L
+        const val SESSION_CHECKPOINT_MILLIS = 5L * 60 * 1_000
         const val MIN_BUFFER_MILLIS = 8_000
         const val MAX_BUFFER_MILLIS = 30_000
         const val BUFFER_FOR_PLAYBACK_MILLIS = 1_000

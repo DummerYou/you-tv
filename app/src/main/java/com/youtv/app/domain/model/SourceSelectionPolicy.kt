@@ -24,7 +24,8 @@ object SourceSelectionPolicy {
     ): List<Int> {
         val available = sources.indices.filterNot(excludedIndices::contains)
         val forced = forcedIndex?.takeIf { it in available }
-        val ranked = available.filterNot { it == forced }.sortedWith(comparator(sources, preferredIndex))
+        val ranks = available.associateWith { rank(sources[it], it == preferredIndex) }
+        val ranked = available.filterNot { it == forced }.sortedWith(comparator(ranks))
         return listOfNotNull(forced) + ranked
     }
 
@@ -51,16 +52,16 @@ object SourceSelectionPolicy {
         (source.totalBufferingMs + STABILITY_BUFFER_PRIOR_MS).toDouble() /
             (source.totalPlaybackMs + STABILITY_PLAYBACK_PRIOR_MS).coerceAtLeast(1L)
 
-    private fun comparator(sources: List<StreamSource>, preferredIndex: Int?): Comparator<Int> =
-        compareBy<Int> { rank(sources[it], it == preferredIndex).healthTier }
-            .thenBy { rank(sources[it], it == preferredIndex).resolutionTier }
-            .thenBy { rank(sources[it], it == preferredIndex).stabilityScore }
-            .thenBy { rank(sources[it], it == preferredIndex).errorCount }
-            .thenBy { rank(sources[it], it == preferredIndex).frameRateRank }
-            .thenBy { rank(sources[it], it == preferredIndex).startupMs }
-            .thenBy { rank(sources[it], it == preferredIndex).bitrateRank }
-            .thenBy { rank(sources[it], it == preferredIndex).preferredRank }
-            .thenBy { rank(sources[it], it == preferredIndex).originalOrder }
+    private fun comparator(ranks: Map<Int, SourceRank>): Comparator<Int> =
+        compareBy<Int> { ranks.getValue(it).healthTier }
+            .thenBy { ranks.getValue(it).resolutionTier }
+            .thenBy { ranks.getValue(it).stabilityScore }
+            .thenBy { ranks.getValue(it).errorCount }
+            .thenBy { ranks.getValue(it).frameRateRank }
+            .thenBy { ranks.getValue(it).startupMs }
+            .thenBy { ranks.getValue(it).bitrateRank }
+            .thenBy { ranks.getValue(it).preferredRank }
+            .thenBy { ranks.getValue(it).originalOrder }
 
     private fun resolutionTier(source: StreamSource, status: SourceHealthStatus): Int {
         if (status != SourceHealthStatus.SUCCESS) return 0

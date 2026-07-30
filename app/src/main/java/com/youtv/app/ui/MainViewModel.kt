@@ -11,7 +11,7 @@ import com.youtv.app.data.repository.PlaylistSourceMode
 import com.youtv.app.domain.model.Channel
 import com.youtv.app.domain.model.ChannelGroup
 import com.youtv.app.domain.model.BlockedSource
-import com.youtv.app.domain.model.EpgGuide
+import com.youtv.app.domain.model.EpgChannelLookup
 import com.youtv.app.domain.model.Program
 import com.youtv.app.domain.model.SourcePlaybackResult
 import kotlinx.coroutines.CancellationException
@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -81,13 +82,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         Triple(activeOverlay, showInfo, favorites)
     }
 
-    private val baseData = combine(
+    private val catalogWithEpg = combine(
         repository.observeGroups(),
-        container.settingsRepository.settings,
         container.epgRepository.guide,
+    ) { groups, guide ->
+        val lookup = EpgChannelLookup(guide)
+        CatalogData(groups.withEpgLogos(lookup), lookup)
+    }.flowOn(Dispatchers.Default)
+
+    private val baseData = combine(
+        catalogWithEpg,
+        container.settingsRepository.settings,
         repository.observeBlockedSources(),
-    ) { groups, settings, guide, blocked ->
-        MainData(groups.withEpgLogos(guide), settings, guide, blocked)
+    ) { catalog, settings, blocked ->
+        MainData(catalog.groups, settings, catalog.epgLookup, blocked)
     }
 
     private val selectedQuality = selectedChannelId.flatMapLatest { channelId ->
@@ -97,9 +105,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val data = combine(baseData, selectedChannelId, selectedQuality) { base, selectedId, quality ->
         if (selectedId == null || quality.isEmpty()) base else base.copy(
             groups = base.groups.map { group ->
-                group.copy(channels = group.channels.map { channel ->
-                    if (channel.id == selectedId) repository.applyQuality(channel, quality) else channel
-                })
+                val selectedIndex = group.channels.indexOfFirst { it.id == selectedId }
+                if (selectedIndex < 0) group else group.copy(
+                    channels = group.channels.toMutableList().apply {
+                        this[selectedIndex] = repository.applyQuality(this[selectedIndex], quality)
+                    },
+                )
             },
         )
     }
@@ -111,14 +122,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         loading,
         message,
     ) { data, (activeOverlay, showInfo, favorites), selectedId, isLoading, currentMessage ->
-        val (groups, settings, guide, blockedSources) = data
+        val (groups, settings, epgLookup, blockedSources) = data
         val allChannels = groups.flatMap { it.channels }
         val safeIndex = selectedId?.let { id -> allChannels.indexOfFirst { it.id == id } }
             ?.takeIf { it >= 0 }
             ?: 0
         val channelPrograms = allChannels.getOrNull(safeIndex)?.let { channel ->
-            val name = channel.name.ifEmpty { channel.title }.lowercase()
-            guide.programs.entries.firstOrNull { (key, _) -> name.contains(key.lowercase()) }?.value
+            epgLookup.programsFor(channel.name.ifEmpty { channel.title })
         }.orEmpty()
         MainUiState(
             groups, allChannels, safeIndex, activeOverlay, settings, isLoading,
@@ -553,29 +563,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return output.toByteArray()
     }
 
-    private fun List<ChannelGroup>.withEpgLogos(guide: EpgGuide): List<ChannelGroup> =
+    private fun List<ChannelGroup>.withEpgLogos(lookup: EpgChannelLookup): List<ChannelGroup> =
         map { group ->
             group.copy(channels = group.channels.map { channel ->
                 if (channel.logo.isNotBlank()) {
                     channel
                 } else {
-                    channel.copy(logo = guide.logoFor(channel.name.ifEmpty { channel.title }))
+                    channel.copy(logo = lookup.logoFor(channel.name.ifEmpty { channel.title }))
                 }
             })
         }
-
-    private fun EpgGuide.logoFor(channelName: String): String {
-        val name = channelName.normalizedChannelName()
-        val epgLogo = logos.entries.firstOrNull { (key, _) ->
-            val candidate = key.normalizedChannelName()
-            name.contains(candidate) || candidate.contains(name)
-        }?.value.orEmpty()
-        return epgLogo
-    }
-
-    private fun String.normalizedChannelName(): String =
-        lowercase()
-            .replace(Regex("""[^\p{IsHan}a-z0-9]+"""), "")
 
     private companion object {
         const val INFO_DISPLAY_MILLIS = 5_000L
@@ -592,6 +589,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 private data class MainData(
     val groups: List<ChannelGroup>,
     val settings: AppSettings,
-    val guide: EpgGuide,
+    val epgLookup: EpgChannelLookup,
     val blockedSources: List<BlockedSource>,
+)
+
+private data class CatalogData(
+    val groups: List<ChannelGroup>,
+    val epgLookup: EpgChannelLookup,
 )

@@ -24,6 +24,7 @@ android {
         targetSdk = 35
         versionCode = getVersionCode()
         versionName = getVersionName()
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildFeatures {
@@ -131,6 +132,8 @@ dependencies {
     implementation(libs.datastore.preferences)
 
     testImplementation(libs.junit)
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 
     implementation(files("libs/lib-decoder-ffmpeg-release.aar"))
 }

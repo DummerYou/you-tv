@@ -69,6 +69,16 @@ class SourceQualityPolicyTest {
         )
     }
 
+    @Test
+    fun `format age is independent from recent health check`() {
+        val source = source(lastCheckedAt = now).copy(formatCheckedAt = now - 31L * DAY)
+        assertEquals(SourceQualityAge.FRESH, SourceQualityPolicy.evaluate(source, now).age)
+        assertEquals(
+            SourceQualityAge.EXPIRED,
+            SourceQualityPolicy.qualityAge(source.formatCheckedAt, now),
+        )
+    }
+
     private fun source(
         healthStatus: SourceHealthStatus = SourceHealthStatus.SUCCESS,
         lastCheckedAt: Long,
