@@ -78,6 +78,13 @@ class ComposeMainActivity : ComponentActivity() {
                 }
             }
         }
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                (application as YouTvApplication).container.networkMonitor.connected.collect { connected ->
+                    if (connected) playerController.onNetworkAvailable()
+                }
+            }
+        }
     }
 
     override fun onResume() {

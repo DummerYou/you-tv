@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -31,6 +32,9 @@ data class AppSettings(
     val epgUrl: String = DEFAULT_EPG_URL,
     val sourceMode: PlaylistSourceMode = PlaylistSourceMode.TEXT,
     val playlistUpdatedAt: String = "",
+    val lastChannelId: String = "",
+    val lastSubscriptionRefreshAt: Long = 0L,
+    val lastEpgRefreshAt: Long = 0L,
 )
 
 class SettingsRepository(private val store: DataStore<Preferences>) {
@@ -59,6 +63,9 @@ class SettingsRepository(private val store: DataStore<Preferences>) {
                 PlaylistSourceMode.TEXT
             },
             playlistUpdatedAt = preferences[Keys.PLAYLIST_UPDATED_AT].orEmpty(),
+            lastChannelId = preferences[Keys.LAST_CHANNEL_ID].orEmpty(),
+            lastSubscriptionRefreshAt = preferences[Keys.LAST_SUBSCRIPTION_REFRESH_AT] ?: 0L,
+            lastEpgRefreshAt = preferences[Keys.LAST_EPG_REFRESH_AT] ?: 0L,
         )
     }
 
@@ -78,6 +85,9 @@ class SettingsRepository(private val store: DataStore<Preferences>) {
     suspend fun setEpgUrl(value: String) = set(Keys.EPG, value)
     suspend fun setSourceMode(value: PlaylistSourceMode) = set(Keys.SOURCE_MODE, value.name)
     suspend fun setPlaylistUpdatedAt(value: String) = set(Keys.PLAYLIST_UPDATED_AT, value)
+    suspend fun setLastChannelId(value: String) = set(Keys.LAST_CHANNEL_ID, value)
+    suspend fun setLastSubscriptionRefreshAt(value: Long) = set(Keys.LAST_SUBSCRIPTION_REFRESH_AT, value)
+    suspend fun setLastEpgRefreshAt(value: Long) = set(Keys.LAST_EPG_REFRESH_AT, value)
 
     private suspend fun <T> set(key: Preferences.Key<T>, value: T) {
         store.edit { it[key] = value }
@@ -101,6 +111,9 @@ class SettingsRepository(private val store: DataStore<Preferences>) {
         val EPG = stringPreferencesKey("epg")
         val SOURCE_MODE = stringPreferencesKey("playlist_source_mode")
         val PLAYLIST_UPDATED_AT = stringPreferencesKey("playlist_updated_at")
+        val LAST_CHANNEL_ID = stringPreferencesKey("last_channel_id")
+        val LAST_SUBSCRIPTION_REFRESH_AT = longPreferencesKey("last_subscription_refresh_at")
+        val LAST_EPG_REFRESH_AT = longPreferencesKey("last_epg_refresh_at")
     }
 
     companion object {

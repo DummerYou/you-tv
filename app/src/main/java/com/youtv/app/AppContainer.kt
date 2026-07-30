@@ -20,7 +20,7 @@ class AppContainer(context: Context) {
     private val gson = Gson()
     val legacyPreferences = LegacyPreferences(appContext)
     private val database = Room.databaseBuilder(appContext, AppDatabase::class.java, "my-tv.db")
-        .addMigrations(AppDatabase.MIGRATION_1_2)
+        .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3)
         .build()
     private val dataStore: DataStore<Preferences> = PreferenceDataStoreFactory.create(
         migrations = listOf(SharedPreferencesMigration(appContext, appContext.getString(R.string.app_name))),
@@ -32,4 +32,5 @@ class AppContainer(context: Context) {
     )
     val settingsRepository = SettingsRepository(dataStore)
     val epgRepository = EpgRepository(appContext)
+    val networkMonitor = NetworkMonitor(appContext)
 }

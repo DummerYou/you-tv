@@ -9,6 +9,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
@@ -26,10 +27,9 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import com.youtv.app.domain.model.Channel
 import com.youtv.app.domain.model.SourceAddressType
-import com.youtv.app.domain.model.SourceHealthStatus
 import com.youtv.app.domain.model.SourcePlaybackEventType
 import com.youtv.app.domain.model.SourcePlaybackResult
-import com.youtv.app.domain.model.SourceQualityPolicy
+import com.youtv.app.domain.model.SourceSelectionPolicy
 import com.youtv.app.domain.model.StreamSource
 import com.youtv.app.requests.HttpClient
 import kotlinx.coroutines.CoroutineScope
@@ -60,7 +60,7 @@ class PlayerController(
     context: Context,
     softDecode: Boolean,
     private val onSourceResult: (SourcePlaybackResult) -> Unit,
-) : Player.Listener, AnalyticsListener {
+) : AnalyticsListener {
     private val renderersFactory = DefaultRenderersFactory(context).setExtensionRendererMode(
         if (softDecode) DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
         else DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON,
@@ -84,7 +84,6 @@ class PlayerController(
         .build()
         .also {
             it.playWhenReady = true
-            it.addListener(this)
             it.addAnalyticsListener(this)
         }
 
@@ -99,30 +98,42 @@ class PlayerController(
     private var sourceAttemptStartedAt = 0L
     private var renderedFirstFrame = false
     private var rebufferEpisodeActive = false
+    private var playbackSegmentStartedAt = 0L
+    private var bufferingSegmentStartedAt = 0L
+    private var sessionStarted = false
+    private var pausedFirstFrameRemainingMs = 0L
     private var hasBandwidthSample = false
     private var latestBitrateEstimate = 0L
     private var actualVideoWidth: Int? = null
     private var actualVideoHeight: Int? = null
     private var lastPersistedFormat: VideoFormatSnapshot? = null
     private var released = false
-    private var attemptToken = 0L
+    private val attemptGate = PlaybackAttemptGate()
+    private var activeAttempt: PlaybackAttempt? = null
     private val controllerJob = SupervisorJob()
     private val scope = CoroutineScope(controllerJob + Dispatchers.Main.immediate)
     private var firstFrameTimeoutJob: Job? = null
     private var rebufferTimeoutJob: Job? = null
+    private var recoveryJob: Job? = null
+    private var recoveryAttempt = 0
 
     fun play(channel: Channel, preferredSource: Int = 0) {
-        if (released || channel.sources.isEmpty()) {
-            if (channel.sources.isEmpty()) {
-                _state.value = PlaybackState.Failed(
-                    channel, 0, SourceAddressType.UNKNOWN, "频道没有可用播放地址",
-                )
-            }
+        if (released) return
+        cancelRecovery(reset = true)
+        if (channel.sources.isEmpty()) {
+            cancelTimeouts()
+            attemptGate.invalidate()
+            activeAttempt = null
+            player.stop()
+            _state.value = PlaybackState.Failed(
+                channel, 0, SourceAddressType.UNKNOWN, "频道没有可用播放地址",
+            )
             return
         }
+        flushSessionStats()
         currentChannel = channel
         val preferred = preferredSource.coerceIn(channel.sources.indices)
-        attemptOrder = buildAttemptOrder(channel, preferred)
+        attemptOrder = buildAttemptOrder(channel, preferred, forced = null)
         attemptPosition = 0
         startCurrentSourceAttempt()
     }
@@ -130,8 +141,10 @@ class PlayerController(
     fun selectSource(index: Int) {
         val channel = currentChannel ?: return
         if (channel.sources.isEmpty()) return
+        cancelRecovery(reset = true)
         val selected = index.coerceIn(channel.sources.indices)
-        attemptOrder = buildAttemptOrder(channel, selected)
+        flushSessionStats()
+        attemptOrder = buildAttemptOrder(channel, selected, forced = selected)
         attemptPosition = 0
         startCurrentSourceAttempt()
     }
@@ -139,23 +152,78 @@ class PlayerController(
     fun retry() {
         val channel = currentChannel ?: return
         if (channel.sources.isEmpty()) return
-        attemptOrder = buildAttemptOrder(channel, sourceIndex.coerceIn(channel.sources.indices))
+        cancelRecovery(reset = true)
+        flushSessionStats()
+        attemptOrder = buildAttemptOrder(
+            channel,
+            sourceIndex.coerceIn(channel.sources.indices),
+            forced = null,
+        )
         attemptPosition = 0
         startCurrentSourceAttempt()
     }
 
+    fun updateChannelSnapshot(channel: Channel) {
+        val previous = currentChannel ?: return
+        if (previous.id != channel.id) return
+        val activeUrl = previous.sources.getOrNull(sourceIndex)?.url
+        val replacementIndex = activeUrl?.let { url -> channel.sources.indexOfFirst { it.url == url } } ?: -1
+        if (replacementIndex < 0) {
+            flushSessionStats()
+            currentChannel = channel
+            if (channel.sources.isEmpty()) {
+                cancelTimeouts()
+                attemptGate.invalidate()
+                activeAttempt = null
+                player.stop()
+                _state.value = PlaybackState.Failed(
+                    channel, 0, SourceAddressType.UNKNOWN, "当前频道的来源已全部屏蔽",
+                )
+                return
+            }
+            attemptOrder = buildAttemptOrder(channel, channel.preferredSource, forced = null)
+            attemptPosition = 0
+            startCurrentSourceAttempt()
+            return
+        }
+        currentChannel = channel
+        sourceIndex = replacementIndex
+        activeAttempt = activeAttempt?.copy(channel = channel, sourceIndex = replacementIndex)
+        attemptOrder = buildAttemptOrder(channel, channel.preferredSource, forced = replacementIndex)
+        attemptPosition = 0
+    }
+
     fun pause() {
+        cancelRecovery(reset = false)
+        if (!renderedFirstFrame && sourceAttemptStartedAt > 0L) {
+            pausedFirstFrameRemainingMs = (FIRST_FRAME_TIMEOUT_MILLIS -
+                (SystemClock.elapsedRealtime() - sourceAttemptStartedAt)).coerceAtLeast(1L)
+        }
+        flushSessionStats()
         cancelTimeouts()
         player.pause()
     }
 
     fun resume() {
         player.play()
-        val channel = currentChannel ?: return
+        if (_state.value is PlaybackState.Failed) {
+            scheduleRecovery()
+            return
+        }
+        val attempt = activeAttempt ?: return
+        val channel = attempt.channel
         if (!renderedFirstFrame) {
-            scheduleFirstFrameTimeout(channel, sourceIndex, attemptToken, FIRST_FRAME_TIMEOUT_MILLIS)
+            val remaining = pausedFirstFrameRemainingMs.takeIf { it > 0L }
+                ?: (FIRST_FRAME_TIMEOUT_MILLIS -
+                    (SystemClock.elapsedRealtime() - sourceAttemptStartedAt)).coerceAtLeast(1L)
+            sourceAttemptStartedAt = SystemClock.elapsedRealtime() - (FIRST_FRAME_TIMEOUT_MILLIS - remaining)
+            pausedFirstFrameRemainingMs = 0L
+            scheduleFirstFrameTimeout(channel, attempt.sourceIndex, attempt.token, remaining)
         } else if (_state.value is PlaybackState.Buffering) {
-            scheduleRebufferTimeout(channel, sourceIndex, attemptToken)
+            startBufferingSegment()
+            scheduleRebufferTimeout(channel, attempt.sourceIndex, attempt.token)
+        } else if (renderedFirstFrame) {
+            startPlaybackSegment()
         }
     }
 
@@ -164,55 +232,44 @@ class PlayerController(
     }
 
     fun stop() {
+        cancelRecovery(reset = true)
+        flushSessionStats()
         cancelTimeouts()
+        attemptGate.invalidate()
+        activeAttempt = null
         player.stop()
         _state.value = PlaybackState.Idle
     }
 
     fun release() {
         if (released) return
+        cancelRecovery(reset = true)
+        flushSessionStats()
         released = true
         cancelTimeouts()
+        attemptGate.invalidate()
+        activeAttempt = null
         controllerJob.cancel()
         probeCoordinator.release()
         player.removeAnalyticsListener(this)
-        player.removeListener(this)
         player.release()
     }
 
-    private fun buildAttemptOrder(channel: Channel, preferred: Int): List<Int> {
-        val quality = channel.sources.map { SourceQualityPolicy.evaluate(it) }
-        return channel.sources.indices.sortedWith(
-            compareBy<Int> {
-                val status = quality[it].healthStatus
-                if (probeCoordinator.isHostCoolingDown(channel.sources[it])) {
-                    10 + sourceHealthRank(status)
-                } else if (it == preferred && status != SourceHealthStatus.TIMEOUT && status != SourceHealthStatus.ERROR) {
-                    -1
-                } else {
-                    sourceHealthRank(status)
-                }
-            }
-                .thenBy {
-                    channel.sources[it].startupMs
-                        ?.takeIf { _ -> quality[it].healthStatus == SourceHealthStatus.SUCCESS }
-                        ?: Long.MAX_VALUE
-                }
-                .thenByDescending {
-                    channel.sources[it].bitrateBps
-                        ?.takeIf { _ -> quality[it].healthStatus == SourceHealthStatus.SUCCESS }
-                        ?: Long.MIN_VALUE
-                }
-                .thenBy { quality[it].errorCount }
-                .thenBy { quality[it].fluctuationCount }
-                .thenBy { it },
-        )
+    fun onNetworkAvailable() {
+        if (released || _state.value !is PlaybackState.Failed) return
+        cancelRecovery(reset = true)
+        retryFailedChannel()
     }
 
-    private fun sourceHealthRank(status: SourceHealthStatus): Int = when (status) {
-        SourceHealthStatus.SUCCESS -> 0
-        SourceHealthStatus.UNKNOWN -> 1
-        SourceHealthStatus.TIMEOUT, SourceHealthStatus.ERROR -> 2
+    private fun buildAttemptOrder(channel: Channel, preferred: Int, forced: Int?): List<Int> {
+        val ranked = SourceSelectionPolicy.rankedIndices(
+            sources = channel.sources,
+            preferredIndex = preferred,
+            forcedIndex = forced,
+        )
+        return ranked.sortedWith(compareBy<Int> {
+            if (it == forced) -1 else if (probeCoordinator.isHostCoolingDown(channel.sources[it])) 1 else 0
+        }.thenBy { ranked.indexOf(it) })
     }
 
     private fun startCurrentSourceAttempt() {
@@ -227,19 +284,21 @@ class PlayerController(
         sourceAttemptStartedAt = SystemClock.elapsedRealtime()
         renderedFirstFrame = false
         rebufferEpisodeActive = false
+        playbackSegmentStartedAt = 0L
+        bufferingSegmentStartedAt = 0L
+        sessionStarted = false
+        pausedFirstFrameRemainingMs = 0L
         hasBandwidthSample = false
         latestBitrateEstimate = 0L
         actualVideoWidth = null
         actualVideoHeight = null
         lastPersistedFormat = null
-        val token = ++attemptToken
         _state.value = PlaybackState.Preparing(channel, sourceIndex)
         reportSourceResult(
             channel = channel,
             source = channel.sources[sourceIndex],
             event = SourcePlaybackEventType.ATTEMPT_STARTED,
         )
-        scheduleFirstFrameTimeout(channel, sourceIndex, token, FIRST_FRAME_TIMEOUT_MILLIS)
         scheduleCandidateProbes(channel)
         prepareCurrentMode()
     }
@@ -252,15 +311,38 @@ class PlayerController(
             finishSourceFailure(SourcePlaybackEventType.ERROR, "播放格式不支持")
             return
         }
+        val remainingBudget = PlaybackTimeBudget.remaining(
+            sourceAttemptStartedAt,
+            SystemClock.elapsedRealtime(),
+            FIRST_FRAME_TIMEOUT_MILLIS,
+        )
+        if (remainingBudget <= 0L) {
+            finishSourceFailure(SourcePlaybackEventType.TIMEOUT, "播放源加载超时")
+            return
+        }
+        firstFrameTimeoutJob?.cancel()
+        val attempt = PlaybackAttempt(
+            token = attemptGate.next(),
+            channel = channel,
+            sourceIndex = sourceIndex,
+        )
+        activeAttempt = attempt
+        scheduleFirstFrameTimeout(
+            channel = channel,
+            scheduledSourceIndex = sourceIndex,
+            token = attempt.token,
+            timeoutMillis = remainingBudget,
+        )
         player.stop()
         player.clearMediaItems()
-        player.setMediaSource(createMediaSource(source, modes[sourceTypeIndex]))
+        player.setMediaSource(createMediaSource(source, modes[sourceTypeIndex], attempt.token))
         player.prepare()
     }
 
-    private fun createMediaSource(source: StreamSource, mode: SourceMode): MediaSource {
+    private fun createMediaSource(source: StreamSource, mode: SourceMode, token: Long): MediaSource {
         val item = MediaItem.Builder()
             .setUri(source.url)
+            .setMediaId(mediaIdFor(token))
             .setLiveConfiguration(
                 MediaItem.LiveConfiguration.Builder()
                     .setTargetOffsetMs(LIVE_TARGET_OFFSET_MILLIS)
@@ -301,6 +383,7 @@ class PlayerController(
     private fun finishSourceFailure(event: SourcePlaybackEventType, message: String) {
         val channel = currentChannel ?: return
         val source = channel.sources[sourceIndex]
+        flushSessionStats()
         reportSourceResult(channel, source, event)
         promoteBestProbedCandidate(channel)
         cancelTimeouts()
@@ -335,12 +418,41 @@ class PlayerController(
     private fun failAllSources(channel: Channel, message: String) {
         cancelTimeouts()
         val source = channel.sources.getOrNull(sourceIndex)
+        attemptGate.invalidate()
+        activeAttempt = null
+        player.stop()
         _state.value = PlaybackState.Failed(
             channel = channel,
             attemptedSources = attemptOrder.size,
             addressType = source?.addressType ?: SourceAddressType.UNKNOWN,
             message = message,
         )
+        scheduleRecovery()
+    }
+
+    private fun scheduleRecovery() {
+        if (recoveryAttempt >= RECOVERY_DELAYS_MILLIS.size || released) return
+        recoveryJob?.cancel()
+        val delayMillis = RECOVERY_DELAYS_MILLIS[recoveryAttempt++]
+        recoveryJob = scope.launch {
+            delay(delayMillis)
+            recoveryJob = null
+            retryFailedChannel()
+        }
+    }
+
+    private fun retryFailedChannel() {
+        val channel = currentChannel ?: return
+        if (channel.sources.isEmpty() || released) return
+        attemptOrder = buildAttemptOrder(channel, channel.preferredSource, forced = null)
+        attemptPosition = 0
+        startCurrentSourceAttempt()
+    }
+
+    private fun cancelRecovery(reset: Boolean) {
+        recoveryJob?.cancel()
+        recoveryJob = null
+        if (reset) recoveryAttempt = 0
     }
 
     private fun reportSourceResult(
@@ -350,12 +462,16 @@ class PlayerController(
         startupMs: Long? = null,
         bitrateBps: Long? = null,
         videoFormat: VideoFormatSnapshot? = null,
+        resultSourceIndex: Int = sourceIndex,
+        playbackMs: Long = 0L,
+        bufferingMs: Long = 0L,
+        sessionIncrement: Int = 0,
     ) {
         onSourceResult(
             SourcePlaybackResult(
                 channelId = channel.id,
                 sourceUrl = source.url,
-                sourceIndex = sourceIndex,
+                sourceIndex = resultSourceIndex,
                 event = event,
                 startupMs = startupMs,
                 bitrateBps = bitrateBps,
@@ -364,7 +480,41 @@ class PlayerController(
                 videoFrameRate = videoFormat?.frameRate,
                 videoCodec = videoFormat?.codec.orEmpty(),
                 videoTrackBitrate = videoFormat?.trackBitrate,
+                playbackMs = playbackMs,
+                bufferingMs = bufferingMs,
+                sessionIncrement = sessionIncrement,
             ),
+        )
+    }
+
+    private fun startPlaybackSegment() {
+        if (!sessionStarted || playbackSegmentStartedAt != 0L) return
+        playbackSegmentStartedAt = SystemClock.elapsedRealtime()
+    }
+
+    private fun startBufferingSegment() {
+        if (!sessionStarted || bufferingSegmentStartedAt != 0L) return
+        bufferingSegmentStartedAt = SystemClock.elapsedRealtime()
+    }
+
+    private fun flushSessionStats() {
+        if (!sessionStarted) return
+        val now = SystemClock.elapsedRealtime()
+        val playbackMs = playbackSegmentStartedAt.takeIf { it > 0L }
+            ?.let { (now - it).coerceAtLeast(0L) } ?: 0L
+        val bufferingMs = bufferingSegmentStartedAt.takeIf { it > 0L }
+            ?.let { (now - it).coerceAtLeast(0L) } ?: 0L
+        playbackSegmentStartedAt = 0L
+        bufferingSegmentStartedAt = 0L
+        if (playbackMs == 0L && bufferingMs == 0L) return
+        val channel = currentChannel ?: return
+        val source = channel.sources.getOrNull(sourceIndex) ?: return
+        reportSourceResult(
+            channel = channel,
+            source = source,
+            event = SourcePlaybackEventType.SESSION_STATS,
+            playbackMs = playbackMs,
+            bufferingMs = bufferingMs,
         )
     }
 
@@ -377,7 +527,7 @@ class PlayerController(
         firstFrameTimeoutJob?.cancel()
         firstFrameTimeoutJob = scope.launch {
             delay(timeoutMillis)
-            if (!released && token == attemptToken && !renderedFirstFrame &&
+            if (!released && attemptGate.isCurrent(token) && !renderedFirstFrame &&
                 currentChannel?.id == channel.id && sourceIndex == scheduledSourceIndex
             ) {
                 finishSourceFailure(SourcePlaybackEventType.TIMEOUT, "播放源加载超时")
@@ -389,7 +539,7 @@ class PlayerController(
         rebufferTimeoutJob?.cancel()
         rebufferTimeoutJob = scope.launch {
             delay(REBUFFER_TIMEOUT_MILLIS)
-            if (!released && token == attemptToken && rebufferEpisodeActive &&
+            if (!released && attemptGate.isCurrent(token) && rebufferEpisodeActive &&
                 currentChannel?.id == channel.id && sourceIndex == scheduledSourceIndex
             ) {
                 finishSourceFailure(SourcePlaybackEventType.TIMEOUT, "播放持续缓冲，已尝试下一源")
@@ -405,42 +555,55 @@ class PlayerController(
         probeCoordinator.cancelActive()
     }
 
-    override fun onPlaybackStateChanged(playbackState: Int) {
-        val channel = currentChannel ?: return
+    override fun onPlaybackStateChanged(eventTime: AnalyticsListener.EventTime, playbackState: Int) {
+        val attempt = activeAttemptFor(eventTime) ?: return
+        val channel = attempt.channel
         when (playbackState) {
             Player.STATE_BUFFERING -> {
-                _state.value = PlaybackState.Buffering(channel, sourceIndex)
+                _state.value = PlaybackState.Buffering(channel, attempt.sourceIndex)
                 if (renderedFirstFrame && player.playWhenReady && !rebufferEpisodeActive) {
+                    flushSessionStats()
+                    startBufferingSegment()
                     rebufferEpisodeActive = true
                     reportSourceResult(
                         channel,
-                        channel.sources[sourceIndex],
+                        channel.sources[attempt.sourceIndex],
                         SourcePlaybackEventType.FLUCTUATION,
+                        resultSourceIndex = attempt.sourceIndex,
                     )
-                    scheduleRebufferTimeout(channel, sourceIndex, attemptToken)
+                    scheduleRebufferTimeout(channel, attempt.sourceIndex, attempt.token)
                     probeCoordinator.schedule(
                         channel = channel,
-                        currentSourceIndex = sourceIndex,
+                        currentSourceIndex = attempt.sourceIndex,
                         orderedCandidates = attemptOrder.drop(attemptPosition + 1),
                         delayMillis = PROBE_TRIGGER_MILLIS,
                     )
                 }
             }
             Player.STATE_READY -> if (renderedFirstFrame && player.playWhenReady) {
+                flushSessionStats()
+                startPlaybackSegment()
                 rebufferEpisodeActive = false
                 rebufferTimeoutJob?.cancel()
                 rebufferTimeoutJob = null
                 probeCoordinator.cancelActive()
-                _state.value = PlaybackState.Playing(channel, sourceIndex)
+                _state.value = PlaybackState.Playing(channel, attempt.sourceIndex)
             }
         }
     }
 
-    override fun onRenderedFirstFrame() {
+    override fun onRenderedFirstFrame(
+        eventTime: AnalyticsListener.EventTime,
+        output: Any,
+        renderTimeMs: Long,
+    ) {
+        val attempt = activeAttemptFor(eventTime) ?: return
         if (renderedFirstFrame) return
-        val channel = currentChannel ?: return
-        val source = channel.sources.getOrNull(sourceIndex) ?: return
+        val channel = attempt.channel
+        val source = channel.sources.getOrNull(attempt.sourceIndex) ?: return
         renderedFirstFrame = true
+        cancelRecovery(reset = true)
+        sessionStarted = true
         rebufferEpisodeActive = false
         cancelTimeouts()
         val startupMs = (SystemClock.elapsedRealtime() - sourceAttemptStartedAt).coerceAtLeast(0L)
@@ -453,20 +616,31 @@ class PlayerController(
         reportSourceResult(
             channel = channel,
             source = source,
+            event = SourcePlaybackEventType.SESSION_STATS,
+            sessionIncrement = 1,
+            resultSourceIndex = attempt.sourceIndex,
+        )
+        startPlaybackSegment()
+        reportSourceResult(
+            channel = channel,
+            source = source,
             event = SourcePlaybackEventType.SUCCESS,
             startupMs = startupMs,
             bitrateBps = bitrate,
             videoFormat = videoFormat,
+            resultSourceIndex = attempt.sourceIndex,
         )
     }
 
-    override fun onVideoSizeChanged(videoSize: VideoSize) {
+    override fun onVideoSizeChanged(eventTime: AnalyticsListener.EventTime, videoSize: VideoSize) {
+        if (activeAttemptFor(eventTime) == null) return
         actualVideoWidth = videoSize.width.takeIf { it > 0 }
         actualVideoHeight = videoSize.height.takeIf { it > 0 }
         persistVideoFormatIfChanged()
     }
 
-    override fun onTracksChanged(tracks: Tracks) {
+    override fun onTracksChanged(eventTime: AnalyticsListener.EventTime, tracks: Tracks) {
+        if (activeAttemptFor(eventTime) == null) return
         persistVideoFormatIfChanged()
     }
 
@@ -510,7 +684,8 @@ class PlayerController(
         else -> codecs.orEmpty().substringBefore(',').ifBlank { sampleMimeType.orEmpty() }
     }
 
-    override fun onPlayerError(error: PlaybackException) {
+    override fun onPlayerError(eventTime: AnalyticsListener.EventTime, error: PlaybackException) {
+        if (activeAttemptFor(eventTime) == null) return
         if (renderedFirstFrame) {
             finishSourceFailure(SourcePlaybackEventType.ERROR, error.errorCodeName)
             return
@@ -532,11 +707,33 @@ class PlayerController(
         totalBytesLoaded: Long,
         bitrateEstimate: Long,
     ) {
+        if (activeAttemptFor(eventTime) == null) return
         if (totalBytesLoaded > 0L && bitrateEstimate > 0L) {
             hasBandwidthSample = true
             latestBitrateEstimate = bitrateEstimate
         }
     }
+
+    private fun activeAttemptFor(eventTime: AnalyticsListener.EventTime): PlaybackAttempt? {
+        val token = eventToken(eventTime) ?: return null
+        val attempt = activeAttempt ?: return null
+        return attempt.takeIf { it.token == token && attemptGate.isCurrent(token) }
+    }
+
+    private fun eventToken(eventTime: AnalyticsListener.EventTime): Long? {
+        if (eventTime.timeline.isEmpty || eventTime.windowIndex !in 0 until eventTime.timeline.windowCount) {
+            return null
+        }
+        return runCatching {
+            val mediaId = eventTime.timeline
+                .getWindow(eventTime.windowIndex, Timeline.Window())
+                .mediaItem.mediaId
+            mediaId.removePrefix(ATTEMPT_MEDIA_ID_PREFIX).toLongOrNull()
+                ?.takeIf { mediaId.startsWith(ATTEMPT_MEDIA_ID_PREFIX) }
+        }.getOrNull()
+    }
+
+    private fun mediaIdFor(token: Long): String = "$ATTEMPT_MEDIA_ID_PREFIX$token"
 
     private enum class SourceMode { HLS, DASH, RTSP, RTMP, PROGRESSIVE }
 
@@ -546,6 +743,12 @@ class PlayerController(
         val frameRate: Float?,
         val codec: String,
         val trackBitrate: Long?,
+    )
+
+    private data class PlaybackAttempt(
+        val token: Long,
+        val channel: Channel,
+        val sourceIndex: Int,
     )
 
     private companion object {
@@ -559,5 +762,7 @@ class PlayerController(
         const val LIVE_TARGET_OFFSET_MILLIS = 3_000L
         const val MIN_LIVE_PLAYBACK_SPEED = 0.97f
         const val MAX_LIVE_PLAYBACK_SPEED = 1.05f
+        const val ATTEMPT_MEDIA_ID_PREFIX = "you-tv-attempt:"
+        val RECOVERY_DELAYS_MILLIS = longArrayOf(15_000L, 30_000L, 60_000L)
     }
 }

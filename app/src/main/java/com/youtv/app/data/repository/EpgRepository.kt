@@ -29,9 +29,24 @@ class EpgRepository(context: Context) {
             val result = runCatching {
                 HttpClient.getClientWithProxy().newCall(Request.Builder().url(url).build()).execute().use { response ->
                     if (!response.isSuccessful) return@use null
-                    val bytes = response.body?.bytes() ?: return@use null
-                    val parsed = EpgParser().parse(bytes.inputStream())
-                    cache.writeBytes(bytes)
+                    val body = response.body ?: return@use null
+                    val temporary = File(cache.parentFile, "${cache.name}.download")
+                    body.byteStream().use { input ->
+                        temporary.outputStream().use { output ->
+                            val buffer = ByteArray(32 * 1024)
+                            var total = 0L
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                total += read
+                                require(total <= MAX_EPG_BYTES) { "EPG 文件超过大小限制" }
+                                output.write(buffer, 0, read)
+                            }
+                        }
+                    }
+                    val parsed = temporary.inputStream().use { EpgParser().parse(it) }
+                    if (cache.exists()) cache.delete()
+                    check(temporary.renameTo(cache)) { "EPG 缓存替换失败" }
                     parsed
                 }
             }.getOrNull()
@@ -48,5 +63,9 @@ class EpgRepository(context: Context) {
         return _guide.value.programs.entries.firstOrNull { (key, _) ->
             name.contains(key.lowercase(), ignoreCase = true)
         }?.value.orEmpty()
+    }
+
+    private companion object {
+        const val MAX_EPG_BYTES = 64L * 1024 * 1024
     }
 }

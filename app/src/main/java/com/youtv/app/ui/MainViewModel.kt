@@ -10,6 +10,7 @@ import com.youtv.app.data.repository.AppSettings
 import com.youtv.app.data.repository.PlaylistSourceMode
 import com.youtv.app.domain.model.Channel
 import com.youtv.app.domain.model.ChannelGroup
+import com.youtv.app.domain.model.BlockedSource
 import com.youtv.app.domain.model.EpgGuide
 import com.youtv.app.domain.model.Program
 import com.youtv.app.domain.model.SourcePlaybackResult
@@ -22,10 +23,14 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import com.youtv.app.requests.HttpClient
 import okhttp3.Request
 import kotlin.coroutines.coroutineContext
@@ -43,6 +48,7 @@ data class MainUiState(
     val programs: List<Program> = emptyList(),
     val infoVisible: Boolean = false,
     val favoriteSnapshotIds: List<String> = emptyList(),
+    val blockedSources: List<BlockedSource> = emptyList(),
 ) {
     val currentChannel: Channel? get() = channels.getOrNull(currentIndex)
     val menuGroups: List<ChannelGroup> get() = buildList {
@@ -56,53 +62,87 @@ data class MainUiState(
         favoriteSnapshotIds.mapNotNull { id -> channels.firstOrNull { it.id == id } }
 }
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val container = (application as com.youtv.app.YouTvApplication).container
     private val repository = container.channelRepository
     private val overlay = MutableStateFlow(Overlay.NONE)
     private val infoVisible = MutableStateFlow(false)
     private val favoriteSnapshotIds = MutableStateFlow<List<String>>(emptyList())
-    private val currentIndex = MutableStateFlow(container.legacyPreferences.position.coerceAtLeast(0))
+    private val selectedChannelId = MutableStateFlow<String?>(null)
     private val loading = MutableStateFlow(true)
     private val message = MutableStateFlow<String?>(null)
     private var infoHideJob: Job? = null
+    private var overlayTimeoutJob: Job? = null
     private var playlistJob: Job? = null
+    private var backgroundRefreshJob: Job? = null
 
     private val chrome = combine(overlay, infoVisible, favoriteSnapshotIds) { activeOverlay, showInfo, favorites ->
         Triple(activeOverlay, showInfo, favorites)
     }
 
-    private val data = combine(
+    private val baseData = combine(
         repository.observeGroups(),
         container.settingsRepository.settings,
         container.epgRepository.guide,
-    ) { groups, settings, guide -> Triple(groups.withEpgLogos(guide), settings, guide) }
+        repository.observeBlockedSources(),
+    ) { groups, settings, guide, blocked ->
+        MainData(groups.withEpgLogos(guide), settings, guide, blocked)
+    }
+
+    private val selectedQuality = selectedChannelId.flatMapLatest { channelId ->
+        if (channelId == null) flowOf(emptyMap()) else repository.observeSourceQuality(channelId)
+    }
+
+    private val data = combine(baseData, selectedChannelId, selectedQuality) { base, selectedId, quality ->
+        if (selectedId == null || quality.isEmpty()) base else base.copy(
+            groups = base.groups.map { group ->
+                group.copy(channels = group.channels.map { channel ->
+                    if (channel.id == selectedId) repository.applyQuality(channel, quality) else channel
+                })
+            },
+        )
+    }
 
     val state: StateFlow<MainUiState> = combine(
         data,
         chrome,
-        currentIndex,
+        selectedChannelId,
         loading,
         message,
-    ) { (groups, settings, guide), (activeOverlay, showInfo, favorites), index, isLoading, currentMessage ->
+    ) { data, (activeOverlay, showInfo, favorites), selectedId, isLoading, currentMessage ->
+        val (groups, settings, guide, blockedSources) = data
         val allChannels = groups.flatMap { it.channels }
-        val safeIndex = index.coerceIn(0, (allChannels.size - 1).coerceAtLeast(0))
+        val safeIndex = selectedId?.let { id -> allChannels.indexOfFirst { it.id == id } }
+            ?.takeIf { it >= 0 }
+            ?: 0
         val channelPrograms = allChannels.getOrNull(safeIndex)?.let { channel ->
             val name = channel.name.ifEmpty { channel.title }.lowercase()
             guide.programs.entries.firstOrNull { (key, _) -> name.contains(key.lowercase()) }?.value
         }.orEmpty()
         MainUiState(
             groups, allChannels, safeIndex, activeOverlay, settings, isLoading,
-            currentMessage, channelPrograms, showInfo, favorites,
+            currentMessage, channelPrograms, showInfo, favorites, blockedSources,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), MainUiState())
 
     init {
         launchPlaylistTask(showGenericError = false) { initializeChannels() }
         viewModelScope.launch {
+            combine(repository.observeGroups(), selectedChannelId, loading) { groups, selectedId, isLoading ->
+                Triple(groups.flatMap { it.channels }, selectedId, isLoading)
+            }.collect { (channels, selectedId, isLoading) ->
+                if (!isLoading && channels.isNotEmpty() && channels.none { it.id == selectedId }) {
+                    selectChannelId(channels.first().id, remember = true)
+                }
+            }
+        }
+        viewModelScope.launch {
             container.epgRepository.loadCache()
-            val epg = container.settingsRepository.settings.first().epgUrl
-            if (epg.isNotBlank()) container.epgRepository.refresh(epg)
+        }
+        viewModelScope.launch {
+            delay(BACKGROUND_REFRESH_FALLBACK_MILLIS)
+            refreshBackgroundIfDue()
         }
     }
 
@@ -111,7 +151,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (value == Overlay.FAVORITES && overlay.value != Overlay.FAVORITES) {
             favoriteSnapshotIds.value = state.value.channels.filter { it.favorite }.map { it.id }
         }
-        overlay.value = if (overlay.value == value) Overlay.NONE else value
+        setOverlay(if (overlay.value == value) Overlay.NONE else value)
+    }
+
+    fun notifyOverlayInteraction() {
+        if (overlay.value != Overlay.NONE && overlay.value != Overlay.SETTINGS) {
+            scheduleOverlayTimeout()
+        }
     }
 
     fun showInfo() {
@@ -129,7 +175,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun closeOverlay(): Boolean {
         if (overlay.value != Overlay.NONE) {
-            overlay.value = Overlay.NONE
+            setOverlay(Overlay.NONE)
             infoVisible.value = false
             return true
         }
@@ -150,10 +196,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectChannel(channel: Channel) {
-        val index = state.value.channels.indexOfFirst { it.id == channel.id }
-        if (index >= 0) {
-            currentIndex.value = index
-            overlay.value = Overlay.NONE
+        if (state.value.channels.any { it.id == channel.id }) {
+            selectChannelId(channel.id, remember = true)
+            setOverlay(Overlay.NONE)
         }
     }
 
@@ -161,8 +206,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val channels = state.value.channels
         if (channels.isEmpty()) return
         val adjusted = if (state.value.settings.channelReversal) -direction else direction
-        val next = (currentIndex.value + adjusted).mod(channels.size)
-        currentIndex.value = next
+        val current = channels.indexOfFirst { it.id == selectedChannelId.value }.takeIf { it >= 0 } ?: 0
+        val next = (current + adjusted).mod(channels.size)
+        selectChannelId(channels[next].id, remember = true)
     }
 
     fun selectChannelNumber(number: Int) {
@@ -171,8 +217,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             message.value = "频道号 $number 不存在"
             return
         }
-        currentIndex.value = number - 1
-        overlay.value = Overlay.NONE
+        selectChannelId(channels[number - 1].id, remember = true)
+        setOverlay(Overlay.NONE)
         showInfo()
     }
 
@@ -185,6 +231,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun rememberSourceResult(result: SourcePlaybackResult) {
         viewModelScope.launch { repository.rememberSourceResult(result) }
+    }
+
+    fun blockSource(channel: Channel, source: com.youtv.app.domain.model.StreamSource) {
+        viewModelScope.launch {
+            repository.blockSource(channel, source)
+            message.value = "已屏蔽 ${channel.title} 的源${source.order + 1}"
+        }
+    }
+
+    fun restoreBlockedSource(source: BlockedSource) {
+        viewModelScope.launch {
+            repository.restoreBlockedSource(source)
+            message.value = "已恢复 ${source.channelName} 的源${source.sourceNumber}"
+        }
+    }
+
+    fun clearBlockedSources() {
+        viewModelScope.launch {
+            repository.clearBlockedSources()
+            message.value = "已恢复全部屏蔽来源"
+        }
     }
 
     fun setChannelReversal(value: Boolean) = viewModelScope.launch {
@@ -286,6 +353,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun onPlaybackStable() {
+        refreshBackgroundIfDue()
+    }
+
+    private fun refreshBackgroundIfDue() {
+        if (backgroundRefreshJob?.isActive == true) return
+        backgroundRefreshJob = viewModelScope.launch {
+            val settings = container.settingsRepository.settings.first()
+            val now = System.currentTimeMillis()
+            if (settings.sourceMode == PlaylistSourceMode.URL && settings.configUrl.isNotBlank() &&
+                now - settings.lastSubscriptionRefreshAt >= BACKGROUND_REFRESH_INTERVAL_MILLIS
+            ) {
+                if (updateFromUrl(settings.configUrl, showResult = false)) {
+                    container.settingsRepository.setLastSubscriptionRefreshAt(System.currentTimeMillis())
+                }
+            }
+            val latest = container.settingsRepository.settings.first()
+            if (latest.epgUrl.isNotBlank() &&
+                now - latest.lastEpgRefreshAt >= BACKGROUND_REFRESH_INTERVAL_MILLIS
+            ) {
+                if (container.epgRepository.refresh(latest.epgUrl)) {
+                    container.settingsRepository.setLastEpgRefreshAt(System.currentTimeMillis())
+                }
+            }
+        }
+    }
+
     fun importPlaylist(content: String) {
         launchPlaylistTask {
             val report = withContext(Dispatchers.IO) { repository.importPlaylist(content) }
@@ -307,25 +401,61 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val settings = container.settingsRepository.settings.first()
         val shouldOpenSetup = settings.configUrl.isBlank() && !hasSavedTextSource()
         migrateLegacyChannels()
-        if (settings.sourceMode == PlaylistSourceMode.URL && settings.configUrl.isNotBlank()) {
-            updateFromUrl(settings.configUrl, showResult = false)
-        }
         if (shouldOpenSetup) {
-            overlay.value = Overlay.SETTINGS
+            setOverlay(Overlay.SETTINGS)
+        }
+        val initializedSettings = container.settingsRepository.settings.first()
+        val channels = repository.observeGroups().first().flatMap { it.channels }
+        val initialId = resolveInitialChannelId(
+            channelIds = channels.map { it.id },
+            defaultChannel = initializedSettings.defaultChannel,
+            lastChannelId = initializedSettings.lastChannelId,
+            legacyPosition = container.legacyPreferences.position,
+        )
+        selectedChannelId.value = initialId
+        if (initialId != null) container.settingsRepository.setLastChannelId(initialId)
+    }
+
+    private fun selectChannelId(channelId: String, remember: Boolean) {
+        selectedChannelId.value = channelId
+        if (remember) viewModelScope.launch {
+            container.settingsRepository.setLastChannelId(channelId)
         }
     }
 
-    private suspend fun updateFromUrl(url: String, showResult: Boolean) {
+    private fun setOverlay(value: Overlay) {
+        overlay.value = value
+        if (value != Overlay.NONE && value != Overlay.SETTINGS) {
+            scheduleOverlayTimeout()
+        } else {
+            overlayTimeoutJob?.cancel()
+            overlayTimeoutJob = null
+        }
+    }
+
+    private fun scheduleOverlayTimeout() {
+        overlayTimeoutJob?.cancel()
+        overlayTimeoutJob = viewModelScope.launch {
+            delay(OVERLAY_TIMEOUT_MILLIS)
+            if (overlay.value != Overlay.NONE && overlay.value != Overlay.SETTINGS) {
+                setOverlay(Overlay.NONE)
+            }
+        }
+    }
+
+    private suspend fun updateFromUrl(url: String, showResult: Boolean): Boolean {
         val content = withContext(Dispatchers.IO) {
             runCatching {
                 HttpClient.getClientWithProxy().newCall(Request.Builder().url(url).build()).execute().use { response ->
-                    if (!response.isSuccessful) null else response.body?.bytes()?.let(PlaylistTextDecoder::decode)
+                    if (!response.isSuccessful) null else response.body?.byteStream()?.use { input ->
+                        PlaylistTextDecoder.decode(input.readLimited(MAX_PLAYLIST_BYTES))
+                    }
                 }
             }.getOrNull()
         }
         if (content.isNullOrBlank()) {
             if (showResult) message.value = "订阅下载失败，继续使用上次频道"
-            return
+            return false
         }
         val report = withContext(Dispatchers.IO) { repository.importPlaylist(content) }
         if (report.isSuccess) {
@@ -335,11 +465,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             container.settingsRepository.setConfigUrl(url)
             container.settingsRepository.setSourceMode(PlaylistSourceMode.URL)
+            container.settingsRepository.setLastSubscriptionRefreshAt(System.currentTimeMillis())
             saveMetadata(report.updatedAt)
             if (showResult) message.value = "订阅已更新：${report.imported} 个频道"
+            return true
         } else if (showResult) {
             message.value = report.issues.firstOrNull()?.message ?: "订阅解析失败"
         }
+        return false
     }
 
     private suspend fun saveMetadata(value: String?) {
@@ -406,6 +539,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun File.readPlaylistText(): String = PlaylistTextDecoder.decode(readBytes())
 
+    private fun InputStream.readLimited(limit: Int): ByteArray {
+        val output = ByteArrayOutputStream(minOf(limit, 64 * 1024))
+        val buffer = ByteArray(16 * 1024)
+        var total = 0
+        while (true) {
+            val read = read(buffer)
+            if (read < 0) break
+            total += read
+            require(total <= limit) { "订阅文件超过大小限制" }
+            output.write(buffer, 0, read)
+        }
+        return output.toByteArray()
+    }
+
     private fun List<ChannelGroup>.withEpgLogos(guide: EpgGuide): List<ChannelGroup> =
         map { group ->
             group.copy(channels = group.channels.map { channel ->
@@ -432,8 +579,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val INFO_DISPLAY_MILLIS = 5_000L
+        const val OVERLAY_TIMEOUT_MILLIS = 10_000L
+        const val BACKGROUND_REFRESH_INTERVAL_MILLIS = 24L * 60 * 60 * 1_000
+        const val BACKGROUND_REFRESH_FALLBACK_MILLIS = 30_000L
+        const val MAX_PLAYLIST_BYTES = 16 * 1024 * 1024
         const val ACTIVE_PLAYLIST_FILE = "channels.txt"
         const val TEXT_PLAYLIST_FILE = "playlist-text.txt"
         const val URL_PLAYLIST_FILE = "playlist-url.txt"
     }
 }
+
+private data class MainData(
+    val groups: List<ChannelGroup>,
+    val settings: AppSettings,
+    val guide: EpgGuide,
+    val blockedSources: List<BlockedSource>,
+)

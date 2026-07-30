@@ -21,6 +21,7 @@ enum class SourcePlaybackEventType {
     ERROR,
     FLUCTUATION,
     FORMAT_CHANGED,
+    SESSION_STATS,
 }
 
 data class StreamSource(
@@ -43,6 +44,9 @@ data class StreamSource(
     val videoFrameRate: Float? = null,
     val videoCodec: String = "",
     val videoTrackBitrate: Long? = null,
+    val totalPlaybackMs: Long = 0L,
+    val totalBufferingMs: Long = 0L,
+    val sessionCount: Int = 0,
 )
 
 data class SourcePlaybackResult(
@@ -57,6 +61,9 @@ data class SourcePlaybackResult(
     val videoFrameRate: Float? = null,
     val videoCodec: String = "",
     val videoTrackBitrate: Long? = null,
+    val playbackMs: Long = 0L,
+    val bufferingMs: Long = 0L,
+    val sessionIncrement: Int = 0,
     val checkedAt: Long = System.currentTimeMillis(),
 )
 

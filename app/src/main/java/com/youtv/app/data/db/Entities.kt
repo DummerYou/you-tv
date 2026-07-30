@@ -67,3 +67,48 @@ data class StreamSourceEntity(
     val videoCodec: String = "",
     val videoTrackBitrate: Long? = null,
 )
+
+@Entity(
+    tableName = "source_quality",
+    primaryKeys = ["channelId", "sourceUrl"],
+    indices = [Index("channelId")],
+)
+data class SourceQualityEntity(
+    val channelId: String,
+    val sourceUrl: String,
+    val healthStatus: String = "UNKNOWN",
+    val startupMs: Long? = null,
+    val bitrateBps: Long? = null,
+    val lastCheckedAt: Long? = null,
+    val firstSeenAt: Long = 0L,
+    val lastAttemptAt: Long? = null,
+    val lastErrorAt: Long? = null,
+    val lastFluctuationAt: Long? = null,
+    val errorCount: Int = 0,
+    val fluctuationCount: Int = 0,
+    val videoWidth: Int? = null,
+    val videoHeight: Int? = null,
+    val videoFrameRate: Float? = null,
+    val videoCodec: String = "",
+    val videoTrackBitrate: Long? = null,
+    val totalPlaybackMs: Long = 0L,
+    val totalBufferingMs: Long = 0L,
+    val sessionCount: Int = 0,
+    val formatCheckedAt: Long? = null,
+)
+
+@Entity(
+    tableName = "blocked_sources",
+    primaryKeys = ["channelKey", "sourceFingerprint"],
+    indices = [Index("channelId")],
+)
+data class BlockedSourceEntity(
+    val channelKey: String,
+    val sourceFingerprint: String,
+    val channelId: String,
+    val channelName: String,
+    val sourceNumber: Int,
+    val videoWidth: Int? = null,
+    val videoHeight: Int? = null,
+    val blockedAt: Long,
+)

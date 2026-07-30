@@ -39,7 +39,7 @@
 | 默认频道源样例 | `app/src/main/res/raw/channels.txt` | 示例可包含 IPv6，但不要放真实敏感 Token。 |
 | 网络、代理、TLS | `app/src/main/java/com/youtv/app/requests/HttpClient.kt` | 不要恢复信任所有证书；用户视频源允许明文 HTTP。 |
 | 数据模型 | `app/src/main/java/com/youtv/app/domain/model/Models.kt` | 频道、来源、节目单、导入报告等公共模型在这里。 |
-| 构建、包名、版本、APK 名 | `app/build.gradle.kts`、`version.json` | 包名保持 `com.youtv.app`；版本当前为 `1.0.3`；APK 输出名保持 `you-tv.apk`。 |
+| 构建、包名、版本、APK 名 | `app/build.gradle.kts`、`version.json` | 包名保持 `com.youtv.app`；版本当前为 `1.1.0`；APK 输出名保持 `you-tv.apk`。 |
 
 ## 常见修改路线
 
@@ -82,7 +82,7 @@ app/build/outputs/apk/release/you-tv.apk
 关键验收点：
 
 - 包名是 `com.youtv.app`。
-- 版本是 `1.0.3`。
+- 版本是 `1.1.0`。
 - 最低系统是 Android 10 / SDK 29。
 - 应用名是 `you-tv`。
 - 本地导入、地址源自动更新、播放、多源切换、EPG、远程配置页面都能打开。

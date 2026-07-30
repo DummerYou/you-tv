@@ -52,6 +52,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -61,12 +63,14 @@ import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.youtv.app.domain.model.Channel
 import com.youtv.app.domain.model.ChannelGroup
+import com.youtv.app.domain.model.BlockedSource
 import com.youtv.app.player.PlaybackState
 import com.youtv.app.player.PlayerController
 import com.youtv.app.domain.model.SourceAddressType
 import com.youtv.app.domain.model.SourceHealthStatus
 import com.youtv.app.domain.model.SourceQualityAge
 import com.youtv.app.domain.model.SourceQualityPolicy
+import com.youtv.app.domain.model.SourceSelectionPolicy
 import com.youtv.app.domain.model.StreamSource
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -115,8 +119,17 @@ fun TvApp(
         }
     }
 
-    LaunchedEffect(state.currentChannel?.id) {
-        state.currentChannel?.let { playerController.play(it, it.preferredSource) }
+    LaunchedEffect(state.loading, state.currentChannel?.id) {
+        if (!state.loading) state.currentChannel?.let { playerController.play(it, it.preferredSource) }
+    }
+    LaunchedEffect(state.currentChannel) {
+        if (!state.loading) state.currentChannel?.let(playerController::updateChannelSnapshot)
+    }
+    LaunchedEffect((playback as? PlaybackState.Playing)?.channel?.id) {
+        if (playback is PlaybackState.Playing) {
+            delay(5_000L)
+            viewModel.onPlaybackStable()
+        }
     }
 
     BackHandler {
@@ -126,6 +139,26 @@ fun TvApp(
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .pointerInput(state.overlay) {
+                if (state.overlay != Overlay.NONE && state.overlay != Overlay.SETTINGS) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            if (event.changes.any { it.pressed && !it.previousPressed }) {
+                                viewModel.notifyOverlayInteraction()
+                            }
+                        }
+                    }
+                }
+            }
+            .onPreviewKeyEvent { event ->
+                if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+                    state.overlay != Overlay.NONE
+                ) {
+                    viewModel.notifyOverlayInteraction()
+                }
+                false
+            }
             .focusRequester(playbackFocusRequester)
             .focusable()
             .background(Color.Black)
@@ -281,6 +314,7 @@ fun TvApp(
                 state = state,
                 playback = playback,
                 onSelectSource = playerController::selectSource,
+                onBlockSource = viewModel::blockSource,
                 onClose = { viewModel.closeOverlay() },
             )
         }
@@ -302,6 +336,8 @@ fun TvApp(
                 onSoftDecode = viewModel::setSoftDecode,
                 onCompactMenu = viewModel::setCompactMenu,
                 onBootStartup = viewModel::setBootStartup,
+                onRestoreBlockedSource = viewModel::restoreBlockedSource,
+                onClearBlockedSources = viewModel::clearBlockedSources,
             )
         }
         state.message?.let {
@@ -346,19 +382,28 @@ private fun ChannelDrawer(
         ?.coerceIn(8, 20) ?: 8
     val panelWidth = (maxChars * 14 + 34).dp
     val listState = rememberLazyListState()
-    val targetIndex = remember(visibleGroups, focusTarget?.second?.id) {
-        val target = focusTarget
+    var initialTargetId by remember { mutableStateOf<String?>(null) }
+    var initialFocusHandled by remember { mutableStateOf(false) }
+    var focusedChannelId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(focusTarget?.second?.id) {
+        if (initialTargetId == null) initialTargetId = focusTarget?.second?.id
+    }
+    val targetIndex = remember(visibleGroups, initialTargetId) {
+        val targetId = initialTargetId
         var index = 0
         visibleGroups.forEach { group ->
-            if (target != null && target.first == group.name && target.second.id in group.channels.map { it.id }) {
-                return@remember index + 1 + group.channels.indexOfFirst { it.id == target.second.id }
+            val channelIndex = group.channels.indexOfFirst { it.id == targetId }
+            if (channelIndex >= 0) {
+                return@remember index + 1 + channelIndex
             }
             index += 1 + group.channels.size
         }
         0
     }
-    LaunchedEffect(focusTarget?.second?.id, visibleGroups) {
-        if (visibleGroups.isNotEmpty()) runCatching { listState.scrollToItem(targetIndex) }
+    LaunchedEffect(initialTargetId) {
+        if (initialTargetId != null && !initialFocusHandled) {
+            runCatching { listState.scrollToItem(targetIndex) }
+        }
     }
     Surface(
         modifier = Modifier
@@ -400,8 +445,12 @@ private fun ChannelDrawer(
                         FocusableRow(
                             channel = channel,
                             playing = channel.id == currentChannel?.id,
-                            requestInitialFocus = channel.id == focusTarget?.second?.id &&
-                                group.name == focusTarget.first,
+                            requestInitialFocus = !initialFocusHandled && channel.id == initialTargetId,
+                            focusedFromDrawer = channel.id == focusedChannelId,
+                            onFocused = {
+                                focusedChannelId = channel.id
+                                if (channel.id == initialTargetId) initialFocusHandled = true
+                            },
                             onFavorite = { onFavorite(channel, !channel.favorite) },
                         ) { onSelect(channel) }
                     }
@@ -418,10 +467,14 @@ private fun FocusableRow(
     channel: Channel,
     playing: Boolean,
     requestInitialFocus: Boolean,
+    focusedFromDrawer: Boolean,
+    onFocused: () -> Unit,
     onFavorite: () -> Unit,
     onClick: () -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
+    var confirmPressed by remember { mutableStateOf(false) }
+    var longPressHandled by remember { mutableStateOf(false) }
     val requester = remember { FocusRequester() }
     val metaText = listOfNotNull(
         "${channel.sources.size}源".takeIf { channel.sources.size > 1 },
@@ -430,21 +483,58 @@ private fun FocusableRow(
     LaunchedEffect(requestInitialFocus) {
         if (requestInitialFocus) runCatching { requester.requestFocus() }
     }
+    val visuallyFocused = focused || focusedFromDrawer
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .onFocusChanged { focused = it.isFocused }
+            .onFocusChanged {
+                focused = it.isFocused
+                if (it.isFocused) onFocused()
+                if (!it.isFocused) {
+                    confirmPressed = false
+                    longPressHandled = false
+                }
+            }
             .focusRequester(requester)
+            .onPreviewKeyEvent {
+                val native = it.nativeKeyEvent
+                when {
+                    native.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                        if (native.action == KeyEvent.ACTION_DOWN && native.repeatCount == 0) onFavorite()
+                        true
+                    }
+                    native.keyCode in CONFIRM_KEY_CODES -> {
+                        when (native.action) {
+                            KeyEvent.ACTION_DOWN -> {
+                                if (native.repeatCount == 0) {
+                                    confirmPressed = true
+                                    longPressHandled = false
+                                } else if (confirmPressed && !longPressHandled) {
+                                    longPressHandled = true
+                                    onFavorite()
+                                }
+                            }
+                            KeyEvent.ACTION_UP -> {
+                                if (confirmPressed && !longPressHandled) onClick()
+                                confirmPressed = false
+                                longPressHandled = false
+                            }
+                        }
+                        true
+                    }
+                    else -> false
+                }
+            }
             .focusable()
             .graphicsLayer {
-                scaleX = if (focused) 1.015f else 1f
-                scaleY = if (focused) 1.015f else 1f
-                shadowElevation = if (focused) 18f else 0f
+                scaleX = if (visuallyFocused) 1.015f else 1f
+                scaleY = if (visuallyFocused) 1.015f else 1f
+                shadowElevation = if (visuallyFocused) 18f else 0f
                 shape = RoundedCornerShape(5.dp)
             }
             .background(
                 when {
-                    focused -> TvFocusFill
+                    visuallyFocused -> TvFocusFill
                     playing -> TvPlayingFill
                     else -> TvRowFill
                 },
@@ -454,21 +544,7 @@ private fun FocusableRow(
                 onClick = onClick,
                 onLongClick = onFavorite,
             )
-            .padding(horizontal = 7.dp, vertical = 4.dp)
-            .onPreviewKeyEvent {
-                if (it.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
-                when (it.nativeKeyEvent.keyCode) {
-                    in CONFIRM_KEY_CODES -> {
-                        if (it.nativeKeyEvent.repeatCount == 0) onClick()
-                        true
-                    }
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                        if (it.nativeKeyEvent.repeatCount == 0) onFavorite()
-                        true
-                    }
-                    else -> false
-                }
-            },
+            .padding(horizontal = 7.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         ChannelLogo(
@@ -483,11 +559,11 @@ private fun FocusableRow(
             modifier = Modifier.weight(1f, fill = false),
             fontSize = 14.sp,
             color = when {
-                focused -> TvAccentText
+                visuallyFocused -> TvAccentText
                 playing -> TvAccent
                 else -> Color.White
             },
-            fontWeight = if (focused || playing) FontWeight.SemiBold else FontWeight.Normal,
+            fontWeight = if (visuallyFocused || playing) FontWeight.SemiBold else FontWeight.Normal,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -496,7 +572,7 @@ private fun FocusableRow(
             Text(
                 metaText,
                 color = when {
-                    focused -> TvAccentText.copy(alpha = 0.72f)
+                    visuallyFocused -> TvAccentText.copy(alpha = 0.72f)
                     channel.favorite -> TvAccent
                     else -> TvMutedText
                 },
@@ -670,6 +746,8 @@ private fun SettingsPanel(
     onSoftDecode: (Boolean) -> Unit,
     onCompactMenu: (Boolean) -> Unit,
     onBootStartup: (Boolean) -> Unit,
+    onRestoreBlockedSource: (BlockedSource) -> Unit,
+    onClearBlockedSources: () -> Unit,
 ) {
     Surface(
         modifier = Modifier
@@ -750,6 +828,30 @@ private fun SettingsPanel(
             item {
             SettingLine("开机自动启动", state.settings.bootStartup) { onBootStartup(!state.settings.bootStartup) }
             }
+            if (state.blockedSources.isNotEmpty()) {
+                item {
+                    Text(
+                        "已屏蔽来源（${state.blockedSources.size}）",
+                        color = TvAccent,
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 6.dp),
+                    )
+                }
+                items(
+                    items = state.blockedSources,
+                    key = { "${it.channelKey}:${it.sourceFingerprint}" },
+                ) { source ->
+                    val quality = if (source.videoWidth != null && source.videoHeight != null) {
+                        " · ${source.videoWidth}×${source.videoHeight}"
+                    } else ""
+                    ActionRow("恢复 ${source.channelName} · 源${source.sourceNumber}$quality") {
+                        onRestoreBlockedSource(source)
+                    }
+                }
+                item {
+                    ActionRow("恢复全部屏蔽来源", onClick = onClearBlockedSources)
+                }
+            }
         }
     }
 }
@@ -767,6 +869,14 @@ private fun ActionRow(label: String, requestInitialFocus: Boolean = false, onCli
             .fillMaxWidth()
             .onFocusChanged { focused = it.isFocused }
             .focusRequester(requester)
+            .onPreviewKeyEvent {
+                if (it.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+                    it.nativeKeyEvent.keyCode in CONFIRM_KEY_CODES
+                ) {
+                    if (it.nativeKeyEvent.repeatCount == 0) onClick()
+                    true
+                } else false
+            }
             .focusable()
             .graphicsLayer {
                 scaleX = if (focused) 1.015f else 1f
@@ -776,15 +886,7 @@ private fun ActionRow(label: String, requestInitialFocus: Boolean = false, onCli
             }
             .background(if (focused) TvFocusFill else TvRowFill, RoundedCornerShape(5.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 5.dp)
-            .onPreviewKeyEvent {
-                if (it.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
-                    it.nativeKeyEvent.keyCode in CONFIRM_KEY_CODES
-                ) {
-                    if (it.nativeKeyEvent.repeatCount == 0) onClick()
-                    true
-                } else false
-            },
+            .padding(horizontal = 6.dp, vertical = 5.dp),
         fontSize = 14.sp,
         color = if (focused) TvAccentText else Color.White,
         fontWeight = if (focused) FontWeight.SemiBold else FontWeight.Normal,
@@ -798,6 +900,14 @@ private fun SettingLine(label: String, checked: Boolean, onClick: () -> Unit) {
         Modifier
             .fillMaxWidth()
             .onFocusChanged { focused = it.isFocused }
+            .onPreviewKeyEvent {
+                if (it.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+                    it.nativeKeyEvent.keyCode in CONFIRM_KEY_CODES
+                ) {
+                    if (it.nativeKeyEvent.repeatCount == 0) onClick()
+                    true
+                } else false
+            }
             .focusable()
             .graphicsLayer {
                 scaleX = if (focused) 1.015f else 1f
@@ -807,15 +917,7 @@ private fun SettingLine(label: String, checked: Boolean, onClick: () -> Unit) {
             }
             .background(if (focused) TvFocusFill else TvRowFill, RoundedCornerShape(5.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 3.dp)
-            .onPreviewKeyEvent {
-                if (it.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
-                    it.nativeKeyEvent.keyCode in CONFIRM_KEY_CODES
-                ) {
-                    if (it.nativeKeyEvent.repeatCount == 0) onClick()
-                    true
-                } else false
-            },
+            .padding(horizontal = 6.dp, vertical = 3.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -837,6 +939,7 @@ private fun SourceSelectorPanel(
     state: MainUiState,
     playback: PlaybackState,
     onSelectSource: (Int) -> Unit,
+    onBlockSource: (Channel, StreamSource) -> Unit,
     onClose: () -> Unit,
 ) {
     val channel = state.currentChannel
@@ -847,8 +950,9 @@ private fun SourceSelectorPanel(
         is PlaybackState.Playing -> playback.sourceIndex
         else -> channel?.preferredSource ?: 0
     }.coerceIn(0, (sources.size - 1).coerceAtLeast(0))
-    val initialCurrentSource = remember(channel?.id) { currentSource }
-    val frozenOrder = remember(channel?.id) {
+    val sourceIdentity = sources.map { it.url to it.headers }
+    val initialCurrentSource = remember(channel?.id, sourceIdentity) { currentSource }
+    val frozenOrder = remember(channel?.id, sourceIdentity) {
         rankedSourceIndices(sources, currentSource).take(MAX_VISIBLE_SOURCES)
     }
     val displayOrder = remember(frozenOrder, currentSource) {
@@ -856,7 +960,9 @@ private fun SourceSelectorPanel(
             .filter { it in sources.indices }
             .take(MAX_VISIBLE_SOURCES)
     }
-    var focusedSource by remember(channel?.id) { mutableStateOf(currentSource) }
+    val recommendedSource = frozenOrder.firstOrNull { it != currentSource }
+    var focusedSource by remember(channel?.id, sourceIdentity) { mutableStateOf(currentSource) }
+    var pendingBlockIndex by remember(channel?.id, sourceIdentity) { mutableStateOf<Int?>(null) }
     val columns = displayOrder.size.coerceIn(1, MAX_SOURCE_COLUMNS)
 
     BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
@@ -913,6 +1019,11 @@ private fun SourceSelectorPanel(
                         fontSize = 13.sp,
                     )
                 }
+                Text(
+                    "短按播放 · 长按确认标记错误源",
+                    color = TvMutedText,
+                    fontSize = 11.sp,
+                )
                 if (sources.isEmpty()) {
                     Text("当前频道没有可用播放源", color = TvMutedText, fontSize = 14.sp)
                 } else {
@@ -930,6 +1041,7 @@ private fun SourceSelectorPanel(
                                 width = cardWidth,
                                 height = cardHeight,
                                 selected = index == currentSource,
+                                recommended = index == recommendedSource,
                                 focusedAsSource = index == focusedSource,
                                 requestInitialFocus = index == initialCurrentSource,
                                 onFocused = {
@@ -939,15 +1051,65 @@ private fun SourceSelectorPanel(
                                     if (index != currentSource) onSelectSource(index)
                                     onClose()
                                 },
+                                onLongConfirm = { pendingBlockIndex = index },
                             )
                         }
                     }
                 }
             }
         }
+        pendingBlockIndex?.let { index ->
+            val source = sources.getOrNull(index)
+            if (channel != null && source != null) {
+                BlockSourceConfirmation(
+                    channel = channel,
+                    source = source,
+                    isLastSource = sources.size == 1,
+                    onCancel = { pendingBlockIndex = null },
+                    onConfirm = {
+                        pendingBlockIndex = null
+                        onBlockSource(channel, source)
+                    },
+                )
+            }
+        }
     }
 }
 
+@Composable
+private fun BlockSourceConfirmation(
+    channel: Channel,
+    source: StreamSource,
+    isLastSource: Boolean,
+    onCancel: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    BackHandler(onBack = onCancel)
+    Surface(
+        modifier = Modifier.widthIn(min = 300.dp, max = 420.dp),
+        color = TvGlassStrong,
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("标记错误来源？", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                "${channel.title} · 源${source.order + 1} 将不再参与播放和自动切源。",
+                color = TvSoftText,
+                fontSize = 13.sp,
+            )
+            if (isLastSource) {
+                Text("这是最后一个可用来源，屏蔽后该频道将暂时无法播放。", color = TvError, fontSize = 12.sp)
+            }
+            ActionRow("取消", requestInitialFocus = true, onClick = onCancel)
+            ActionRow("确认屏蔽", onClick = onConfirm)
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SourceChip(
     source: StreamSource,
@@ -955,12 +1117,16 @@ private fun SourceChip(
     width: androidx.compose.ui.unit.Dp,
     height: androidx.compose.ui.unit.Dp,
     selected: Boolean,
+    recommended: Boolean,
     focusedAsSource: Boolean,
     requestInitialFocus: Boolean,
     onFocused: () -> Unit,
     onConfirm: () -> Unit,
+    onLongConfirm: () -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
+    var confirmPressed by remember { mutableStateOf(false) }
+    var longPressHandled by remember { mutableStateOf(false) }
     val requester = remember { FocusRequester() }
     LaunchedEffect(requestInitialFocus) {
         if (requestInitialFocus) runCatching { requester.requestFocus() }
@@ -972,8 +1138,33 @@ private fun SourceChip(
             .onFocusChanged {
                 focused = it.isFocused
                 if (it.isFocused) onFocused()
+                if (!it.isFocused) {
+                    confirmPressed = false
+                    longPressHandled = false
+                }
             }
             .focusRequester(requester)
+            .onPreviewKeyEvent {
+                val native = it.nativeKeyEvent
+                if (native.keyCode !in CONFIRM_KEY_CODES) return@onPreviewKeyEvent false
+                when (native.action) {
+                    KeyEvent.ACTION_DOWN -> {
+                        if (native.repeatCount == 0) {
+                            confirmPressed = true
+                            longPressHandled = false
+                        } else if (confirmPressed && !longPressHandled) {
+                            longPressHandled = true
+                            onLongConfirm()
+                        }
+                    }
+                    KeyEvent.ACTION_UP -> {
+                        if (confirmPressed && !longPressHandled) onConfirm()
+                        confirmPressed = false
+                        longPressHandled = false
+                    }
+                }
+                true
+            }
             .focusable()
             .graphicsLayer {
                 scaleX = if (focused) 1.03f else 1f
@@ -989,17 +1180,7 @@ private fun SourceChip(
                 },
                 RoundedCornerShape(7.dp),
             )
-            .clickable(onClick = onConfirm)
-            .onPreviewKeyEvent {
-                if (it.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
-                when (it.nativeKeyEvent.keyCode) {
-                    in CONFIRM_KEY_CODES -> {
-                        if (it.nativeKeyEvent.repeatCount == 0) onConfirm()
-                        true
-                    }
-                    else -> false
-                }
-            },
+            .combinedClickable(onClick = onConfirm, onLongClick = onLongConfirm),
         contentAlignment = Alignment.CenterStart,
     ) {
         val active = focused || focusedAsSource
@@ -1022,6 +1203,14 @@ private fun SourceChip(
                 if (selected) {
                     Text(
                         "当前",
+                        fontSize = 9.sp,
+                        lineHeight = 11.sp,
+                        color = if (active) TvAccentText else TvAccent,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                } else if (recommended) {
+                    Text(
+                        "推荐",
                         fontSize = 9.sp,
                         lineHeight = 11.sp,
                         color = if (active) TvAccentText else TvAccent,
@@ -1057,29 +1246,7 @@ private fun SourceChip(
 }
 
 private fun rankedSourceIndices(sources: List<StreamSource>, currentSource: Int): List<Int> =
-    sources.map { SourceQualityPolicy.evaluate(it) }.let { quality -> sources.indices.sortedWith(
-        compareBy<Int> {
-            when {
-                it == currentSource -> -1
-                quality[it].healthStatus == SourceHealthStatus.SUCCESS -> 0
-                quality[it].healthStatus == SourceHealthStatus.UNKNOWN -> 1
-                else -> 2
-            }
-        }
-            .thenBy {
-                sources[it].startupMs
-                    ?.takeIf { _ -> quality[it].healthStatus == SourceHealthStatus.SUCCESS }
-                    ?: Long.MAX_VALUE
-            }
-            .thenByDescending {
-                sources[it].bitrateBps
-                    ?.takeIf { _ -> quality[it].healthStatus == SourceHealthStatus.SUCCESS }
-                    ?: Long.MIN_VALUE
-            }
-            .thenBy { quality[it].errorCount }
-            .thenBy { quality[it].fluctuationCount }
-            .thenBy { it },
-    ) }
+    SourceSelectionPolicy.rankedIndices(sources, preferredIndex = currentSource)
 
 private fun sourceHealthText(source: StreamSource, age: SourceQualityAge): String {
     if (age == SourceQualityAge.EXPIRED) {

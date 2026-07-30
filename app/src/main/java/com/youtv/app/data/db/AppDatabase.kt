@@ -6,8 +6,14 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [ChannelGroupEntity::class, ChannelEntity::class, StreamSourceEntity::class],
-    version = 2,
+    entities = [
+        ChannelGroupEntity::class,
+        ChannelEntity::class,
+        StreamSourceEntity::class,
+        SourceQualityEntity::class,
+        BlockedSourceEntity::class,
+    ],
+    version = 3,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -55,6 +61,70 @@ abstract class AppDatabase : RoomDatabase() {
                               AND stream_sources.sortOrder = channels.lastSuccessfulSource
                             LIMIT 1
                         ), '')""",
+                )
+            }
+        }
+
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    """CREATE TABLE IF NOT EXISTS source_quality (
+                        channelId TEXT NOT NULL,
+                        sourceUrl TEXT NOT NULL,
+                        healthStatus TEXT NOT NULL,
+                        startupMs INTEGER,
+                        bitrateBps INTEGER,
+                        lastCheckedAt INTEGER,
+                        firstSeenAt INTEGER NOT NULL,
+                        lastAttemptAt INTEGER,
+                        lastErrorAt INTEGER,
+                        lastFluctuationAt INTEGER,
+                        errorCount INTEGER NOT NULL,
+                        fluctuationCount INTEGER NOT NULL,
+                        videoWidth INTEGER,
+                        videoHeight INTEGER,
+                        videoFrameRate REAL,
+                        videoCodec TEXT NOT NULL,
+                        videoTrackBitrate INTEGER,
+                        totalPlaybackMs INTEGER NOT NULL,
+                        totalBufferingMs INTEGER NOT NULL,
+                        sessionCount INTEGER NOT NULL,
+                        formatCheckedAt INTEGER,
+                        PRIMARY KEY(channelId, sourceUrl)
+                    )""",
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_source_quality_channelId ON source_quality(channelId)",
+                )
+                database.execSQL(
+                    """INSERT OR REPLACE INTO source_quality (
+                        channelId, sourceUrl, healthStatus, startupMs, bitrateBps, lastCheckedAt,
+                        firstSeenAt, lastAttemptAt, lastErrorAt, lastFluctuationAt, errorCount,
+                        fluctuationCount, videoWidth, videoHeight, videoFrameRate, videoCodec,
+                        videoTrackBitrate, totalPlaybackMs, totalBufferingMs, sessionCount,
+                        formatCheckedAt
+                    ) SELECT channelId, url, healthStatus, startupMs, bitrateBps, lastCheckedAt,
+                        firstSeenAt, lastAttemptAt, lastErrorAt, lastFluctuationAt, errorCount,
+                        fluctuationCount, videoWidth, videoHeight, videoFrameRate, videoCodec,
+                        videoTrackBitrate, 0, 0, 0,
+                        CASE WHEN videoWidth IS NULL THEN NULL ELSE lastCheckedAt END
+                    FROM stream_sources""",
+                )
+                database.execSQL(
+                    """CREATE TABLE IF NOT EXISTS blocked_sources (
+                        channelKey TEXT NOT NULL,
+                        sourceFingerprint TEXT NOT NULL,
+                        channelId TEXT NOT NULL,
+                        channelName TEXT NOT NULL,
+                        sourceNumber INTEGER NOT NULL,
+                        videoWidth INTEGER,
+                        videoHeight INTEGER,
+                        blockedAt INTEGER NOT NULL,
+                        PRIMARY KEY(channelKey, sourceFingerprint)
+                    )""",
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_blocked_sources_channelId ON blocked_sources(channelId)",
                 )
             }
         }
