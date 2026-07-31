@@ -56,11 +56,17 @@ class SourceProbeCoordinator {
         currentSourceIndex: Int,
         orderedCandidates: List<Int>,
         delayMillis: Long,
+        candidateLimit: Int = MAX_CONCURRENT_PROBES,
     ) {
         cancelActive()
         activeJob = scope.launch {
             delay(delayMillis)
-            val candidates = selectCandidates(channel, currentSourceIndex, orderedCandidates)
+            val candidates = selectCandidates(
+                channel,
+                currentSourceIndex,
+                orderedCandidates,
+                candidateLimit.coerceIn(0, MAX_CONCURRENT_PROBES),
+            )
             coroutineScope {
                 candidates.map { index ->
                     async { probeAndCache(channel.sources[index]) }
@@ -101,12 +107,13 @@ class SourceProbeCoordinator {
         channel: Channel,
         currentSourceIndex: Int,
         orderedCandidates: List<Int>,
+        candidateLimit: Int,
     ): List<Int> {
         val now = nowMillis()
         val selectedHosts = mutableSetOf<String>()
         return buildList {
             orderedCandidates.forEach { index ->
-                if (size >= MAX_CONCURRENT_PROBES || index == currentSourceIndex) return@forEach
+                if (size >= candidateLimit || index == currentSourceIndex) return@forEach
                 val source = channel.sources.getOrNull(index) ?: return@forEach
                 val url = source.url.toHttpUrlOrNull() ?: return@forEach
                 if (url.scheme !in HTTP_SCHEMES || !selectedHosts.add(url.host)) return@forEach

@@ -23,3 +23,8 @@
 -keep class com.youtv.app.data.** {
     <fields>;
 }
+
+# Room uses the database implementation's generated class name through reflection.
+-keep class com.youtv.app.data.db.AppDatabase_Impl {
+    *;
+}

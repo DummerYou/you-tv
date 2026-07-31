@@ -284,7 +284,7 @@ class ChannelRepository(
             videoCodec = result.videoCodec,
             videoTrackBitrate = result.videoTrackBitrate,
         )
-        if (status == SourceHealthStatus.SUCCESS) {
+        if (status == SourceHealthStatus.SUCCESS && result.updateRememberedSource) {
             dao.setLastSuccessfulSource(result.channelId, result.sourceIndex, result.sourceKey)
         }
     }

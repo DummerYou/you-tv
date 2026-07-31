@@ -26,6 +26,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -66,6 +68,9 @@ import com.youtv.app.domain.model.ChannelGroup
 import com.youtv.app.domain.model.BlockedSource
 import com.youtv.app.player.PlaybackState
 import com.youtv.app.player.PlayerController
+import com.youtv.app.player.SourceTestResult
+import com.youtv.app.player.SourceTestState
+import com.youtv.app.player.SourceTestStatus
 import com.youtv.app.domain.model.SourceAddressType
 import com.youtv.app.domain.model.SourceHealthStatus
 import com.youtv.app.domain.model.SourceQualityAge
@@ -87,6 +92,7 @@ fun TvApp(
 ) {
     val state by viewModel.state.collectAsState()
     val playback by playerController.state.collectAsState()
+    val sourceTest by playerController.sourceTestState.collectAsState()
     val playbackFocusRequester = remember { FocusRequester() }
     var channelDigits by remember { mutableStateOf("") }
     var volumeUi by remember { mutableStateOf<VolumeUi?>(null) }
@@ -94,6 +100,20 @@ fun TvApp(
     LaunchedEffect(state.overlay) {
         if (state.overlay == Overlay.NONE) {
             runCatching { playbackFocusRequester.requestFocus() }
+        }
+        if (state.overlay != Overlay.PROGRAM && sourceTest !is SourceTestState.Idle) {
+            playerController.clearSourceTest()
+        }
+    }
+
+    LaunchedEffect(sourceTest, state.overlay) {
+        if (state.overlay != Overlay.PROGRAM || sourceTest is SourceTestState.Idle) {
+            return@LaunchedEffect
+        }
+        viewModel.notifyOverlayInteraction()
+        while (sourceTest is SourceTestState.Running) {
+            delay(SOURCE_TEST_OVERLAY_KEEP_ALIVE_MILLIS)
+            viewModel.notifyOverlayInteraction()
         }
     }
 
@@ -313,9 +333,15 @@ fun TvApp(
             SourceSelectorPanel(
                 state = state,
                 playback = playback,
+                sourceTest = sourceTest,
                 onSelectSource = playerController::selectSource,
+                onStartSourceTest = playerController::startSourceTest,
+                onStopSourceTest = { playerController.stopSourceTest() },
                 onBlockSource = viewModel::blockSource,
-                onClose = { viewModel.closeOverlay() },
+                onClose = {
+                    playerController.clearSourceTest()
+                    viewModel.closeOverlay()
+                },
             )
         }
         AnimatedVisibility(
@@ -598,9 +624,20 @@ private fun PlaybackStatus(state: PlaybackState, retry: () -> Unit) {
         )
         is PlaybackState.Playing -> Unit
         is PlaybackState.Failed -> {
+            val address = when (state.addressType) {
+                SourceAddressType.IPV4 -> "IPv4"
+                SourceAddressType.IPV6 -> "IPv6"
+                SourceAddressType.HOSTNAME -> "域名"
+                SourceAddressType.UNKNOWN -> "播放源"
+            }
+            val attempted = if (state.attemptedSources > 1) {
+                "\n已尝试 ${state.attemptedSources} 个来源"
+            } else {
+                ""
+            }
             InfoPanel(
                 "播放失败",
-                "${state.addressType} · ${state.message}\n按确认键打开频道列表，切换其他来源或重试",
+                "$address · ${state.message}$attempted\n按左键选择来源，按确认键打开频道列表",
                 Alignment.Center,
             )
         }
@@ -938,7 +975,10 @@ private fun SettingLine(label: String, checked: Boolean, onClick: () -> Unit) {
 private fun SourceSelectorPanel(
     state: MainUiState,
     playback: PlaybackState,
+    sourceTest: SourceTestState,
     onSelectSource: (Int) -> Unit,
+    onStartSourceTest: () -> Unit,
+    onStopSourceTest: () -> Unit,
     onBlockSource: (Channel, StreamSource) -> Unit,
     onClose: () -> Unit,
 ) {
@@ -952,13 +992,33 @@ private fun SourceSelectorPanel(
     }.coerceIn(0, (sources.size - 1).coerceAtLeast(0))
     val sourceIdentity = sources.map { it.url to it.headers }
     val initialCurrentSource = remember(channel?.id, sourceIdentity) { currentSource }
-    val frozenOrder = remember(channel?.id, sourceIdentity) {
-        rankedSourceIndices(sources, currentSource).take(MAX_VISIBLE_SOURCES)
+    val runningTest = sourceTest as? SourceTestState.Running
+    val isTestRunning = runningTest?.channelId == channel?.id
+    val testResults = when (sourceTest) {
+        is SourceTestState.Running ->
+            sourceTest.results.takeIf { sourceTest.channelId == channel?.id }.orEmpty()
+        is SourceTestState.Completed ->
+            sourceTest.results.takeIf { sourceTest.channelId == channel?.id }.orEmpty()
+        SourceTestState.Idle -> emptyMap()
     }
-    val displayOrder = remember(frozenOrder, currentSource) {
-        (listOf(currentSource) + frozenOrder.filterNot { it == currentSource })
-            .filter { it in sources.indices }
-            .take(MAX_VISIBLE_SOURCES)
+    val completedResults = (sourceTest as? SourceTestState.Completed)
+        ?.takeIf { it.channelId == channel?.id }
+        ?.results
+        .orEmpty()
+    val frozenOrder = remember(channel?.id, sourceIdentity, completedResults) {
+        val rankedSources = sources.mapIndexed { index, source ->
+            source.withSourceTestResult(completedResults[index])
+        }
+        rankedSourceIndices(rankedSources, currentSource).take(MAX_VISIBLE_SOURCES)
+    }
+    val displayOrder = remember(frozenOrder, currentSource, isTestRunning, sourceIdentity) {
+        if (isTestRunning) {
+            sources.indices.toList()
+        } else {
+            (listOf(currentSource) + frozenOrder.filterNot { it == currentSource })
+                .filter { it in sources.indices }
+                .take(MAX_VISIBLE_SOURCES)
+        }
     }
     val recommendedSource = frozenOrder.firstOrNull { it != currentSource }
     var focusedSource by remember(channel?.id, sourceIdentity) { mutableStateOf(currentSource) }
@@ -967,17 +1027,18 @@ private fun SourceSelectorPanel(
 
     BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
         val rows = ((displayOrder.size + columns - 1) / columns).coerceAtLeast(1)
+        val layoutRows = if (isTestRunning) rows.coerceAtMost(4) else rows
         val gapsWidth = SOURCE_CARD_GAP * (columns - 1)
-        val gapsHeight = SOURCE_CARD_GAP * (rows - 1)
+        val gapsHeight = SOURCE_CARD_GAP * (layoutRows - 1)
         val availableWidth = (maxWidth - 72.dp).coerceAtLeast(1.dp)
         val cardWidth = minOf(SOURCE_CARD_WIDTH, (availableWidth - gapsWidth) / columns)
             .coerceAtLeast(100.dp)
         val compactHeight = maxHeight < 500.dp
         val panelBottomPadding = if (compactHeight) 8.dp else 20.dp
-        val reservedHeight = if (compactHeight) 80.dp else 92.dp
+        val reservedHeight = if (compactHeight) 126.dp else 140.dp
         val cardHeight = minOf(
             SOURCE_CARD_HEIGHT,
-            ((maxHeight - reservedHeight - gapsHeight) / rows).coerceAtLeast(62.dp),
+            ((maxHeight - reservedHeight - gapsHeight) / layoutRows).coerceAtLeast(62.dp),
         )
         val flowWidth = cardWidth * columns + gapsWidth
         val panelWidth = flowWidth + 32.dp + SOURCE_LAYOUT_TOLERANCE
@@ -1010,7 +1071,7 @@ private fun SourceSelectorPanel(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        if (sources.size > MAX_VISIBLE_SOURCES) {
+                        if (!isTestRunning && sources.size > MAX_VISIBLE_SOURCES) {
                             "当前源 ${currentSource + 1}/${sources.size} · 显示前 $MAX_VISIBLE_SOURCES 个"
                         } else {
                             "当前源 ${currentSource + 1}/${sources.size.coerceAtLeast(1)}"
@@ -1027,8 +1088,29 @@ private fun SourceSelectorPanel(
                 if (sources.isEmpty()) {
                     Text("当前频道没有可用播放源", color = TvMutedText, fontSize = 14.sp)
                 } else {
+                    SourceTestButton(
+                        label = if (isTestRunning) {
+                            "停止（${runningTest!!.currentIndex + 1}/${runningTest.total}）"
+                        } else {
+                            "测源"
+                        },
+                        onClick = if (isTestRunning) onStopSourceTest else onStartSourceTest,
+                    )
                     FlowRow(
-                        modifier = Modifier.width(flowWidth),
+                        modifier = Modifier
+                            .width(flowWidth)
+                            .then(
+                                if (isTestRunning && rows > layoutRows) {
+                                    Modifier
+                                        .height(
+                                            cardHeight * layoutRows +
+                                                SOURCE_CARD_GAP * (layoutRows - 1)
+                                        )
+                                        .verticalScroll(rememberScrollState())
+                                } else {
+                                    Modifier
+                                },
+                            ),
                         maxItemsInEachRow = columns,
                         horizontalArrangement = Arrangement.spacedBy(SOURCE_CARD_GAP),
                         verticalArrangement = Arrangement.spacedBy(SOURCE_CARD_GAP),
@@ -1044,14 +1126,18 @@ private fun SourceSelectorPanel(
                                 recommended = index == recommendedSource,
                                 focusedAsSource = index == focusedSource,
                                 requestInitialFocus = index == initialCurrentSource,
+                                testResult = testResults[index],
                                 onFocused = {
                                     focusedSource = index
                                 },
                                 onConfirm = {
-                                    if (index != currentSource) onSelectSource(index)
+                                    if (isTestRunning) onStopSourceTest()
+                                    if (isTestRunning || index != currentSource) onSelectSource(index)
                                     onClose()
                                 },
-                                onLongConfirm = { pendingBlockIndex = index },
+                                onLongConfirm = {
+                                    if (!isTestRunning) pendingBlockIndex = index
+                                },
                             )
                         }
                     }
@@ -1073,6 +1159,42 @@ private fun SourceSelectorPanel(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun SourceTestButton(
+    label: String,
+    onClick: () -> Unit,
+) {
+    var focused by remember { mutableStateOf(false) }
+    Box(
+        modifier = Modifier
+            .widthIn(min = 112.dp)
+            .height(38.dp)
+            .onFocusChanged { focused = it.isFocused }
+            .onPreviewKeyEvent {
+                val native = it.nativeKeyEvent
+                if (native.keyCode !in CONFIRM_KEY_CODES) return@onPreviewKeyEvent false
+                if (native.action == KeyEvent.ACTION_DOWN && native.repeatCount == 0) onClick()
+                true
+            }
+            .focusable()
+            .background(
+                if (focused) TvAccent else TvChipFill,
+                RoundedCornerShape(7.dp),
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            color = if (focused) TvAccentText else Color.White,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+        )
     }
 }
 
@@ -1120,6 +1242,7 @@ private fun SourceChip(
     recommended: Boolean,
     focusedAsSource: Boolean,
     requestInitialFocus: Boolean,
+    testResult: SourceTestResult?,
     onFocused: () -> Unit,
     onConfirm: () -> Unit,
     onLongConfirm: () -> Unit,
@@ -1220,7 +1343,8 @@ private fun SourceChip(
                 }
             }
             Text(
-                sourceVideoFormatText(source, formatAge),
+                sourceTestVideoFormatText(testResult)
+                    ?: sourceVideoFormatText(source, formatAge),
                 color = if (active) TvAccentText.copy(alpha = 0.82f) else TvSoftText,
                 fontSize = 9.sp,
                 lineHeight = 11.sp,
@@ -1228,8 +1352,14 @@ private fun SourceChip(
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                sourceHealthText(source, quality.age),
-                color = if (active) TvAccentText else sourceHealthColor(quality.healthStatus),
+                sourceTestHealthText(testResult)
+                    ?: sourceHealthText(source, quality.age),
+                color = if (active) {
+                    TvAccentText
+                } else {
+                    testResult?.let(::sourceTestColor)
+                        ?: sourceHealthColor(quality.healthStatus)
+                },
                 fontSize = 9.sp,
                 lineHeight = 11.sp,
                 maxLines = 1,
@@ -1244,6 +1374,84 @@ private fun SourceChip(
             )
         }
     }
+}
+
+private fun sourceTestVideoFormatText(result: SourceTestResult?): String? {
+    result ?: return null
+    val width = result.videoWidth ?: return if (result.status == SourceTestStatus.TESTING) {
+        "正在识别画质"
+    } else {
+        null
+    }
+    val height = result.videoHeight ?: return null
+    return buildList {
+        add("${width}×$height")
+        result.videoFrameRate?.takeIf { it > 0f }?.let { frameRate ->
+            add(
+                if (frameRate % 1f < 0.05f) {
+                    "${frameRate.toInt()}fps"
+                } else {
+                    String.format(Locale.US, "%.1ffps", frameRate)
+                },
+            )
+        }
+        result.videoCodec.takeIf(String::isNotBlank)?.let(::add)
+    }.joinToString(" · ")
+}
+
+private fun sourceTestHealthText(result: SourceTestResult?): String? {
+    result ?: return null
+    val detail = buildList {
+        result.startupMs?.let { add(formatDuration(it)) }
+        result.bitrateBps?.takeIf { it > 0L }?.let {
+            add(String.format(Locale.US, "%.1f Mbps", it / 1_000_000.0))
+        }
+    }.joinToString(" · ")
+    val status = when (result.status) {
+        SourceTestStatus.PENDING -> "待测"
+        SourceTestStatus.TESTING -> "测试中"
+        SourceTestStatus.AVAILABLE -> "可用"
+        SourceTestStatus.FLUCTUATING -> "可用 · 有波动"
+        SourceTestStatus.TIMEOUT -> "加载超时"
+        SourceTestStatus.FAILED -> "播放失败"
+    }
+    return if (detail.isBlank()) status else "$status · $detail"
+}
+
+private fun sourceTestColor(result: SourceTestResult): Color = when (result.status) {
+    SourceTestStatus.AVAILABLE -> TvAccent
+    SourceTestStatus.TESTING -> TvAccent
+    SourceTestStatus.FLUCTUATING -> Color(0xFFFFC857)
+    SourceTestStatus.TIMEOUT, SourceTestStatus.FAILED -> TvError
+    SourceTestStatus.PENDING -> TvMutedText
+}
+
+private fun StreamSource.withSourceTestResult(result: SourceTestResult?): StreamSource {
+    result ?: return this
+    val testedHealth = when (result.status) {
+        SourceTestStatus.AVAILABLE, SourceTestStatus.FLUCTUATING -> SourceHealthStatus.SUCCESS
+        SourceTestStatus.TIMEOUT -> SourceHealthStatus.TIMEOUT
+        SourceTestStatus.FAILED -> SourceHealthStatus.ERROR
+        SourceTestStatus.PENDING, SourceTestStatus.TESTING -> healthStatus
+    }
+    return copy(
+        healthStatus = testedHealth,
+        startupMs = result.startupMs ?: startupMs,
+        bitrateBps = result.bitrateBps ?: bitrateBps,
+        lastCheckedAt = if (result.status == SourceTestStatus.PENDING) lastCheckedAt
+        else System.currentTimeMillis(),
+        fluctuationCount = if (result.status == SourceTestStatus.FLUCTUATING) {
+            fluctuationCount + 1
+        } else {
+            fluctuationCount
+        },
+        videoWidth = result.videoWidth ?: videoWidth,
+        videoHeight = result.videoHeight ?: videoHeight,
+        videoFrameRate = result.videoFrameRate ?: videoFrameRate,
+        videoCodec = result.videoCodec.ifBlank { videoCodec },
+        formatCheckedAt = if (result.videoWidth != null) System.currentTimeMillis()
+        else formatCheckedAt,
+    )
 }
 
 private fun rankedSourceIndices(sources: List<StreamSource>, currentSource: Int): List<Int> =
@@ -1485,6 +1693,7 @@ private val TvLogoBackdrop = Color(0x1FFFFFFF)
 private const val CHANNEL_NUMBER_DELAY_MILLIS = 1_500L
 private const val VOLUME_DISPLAY_MILLIS = 2_000L
 private const val MESSAGE_DISPLAY_MILLIS = 3_000L
+private const val SOURCE_TEST_OVERLAY_KEEP_ALIVE_MILLIS = 5_000L
 private val CONFIRM_KEY_CODES = setOf(
     KeyEvent.KEYCODE_DPAD_CENTER,
     KeyEvent.KEYCODE_ENTER,

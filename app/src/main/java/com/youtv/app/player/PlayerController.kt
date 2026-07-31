@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.SystemClock
 import androidx.annotation.OptIn
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
@@ -16,6 +17,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.datasource.rtmp.RtmpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultLivePlaybackSpeedControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
@@ -42,6 +44,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 
 sealed interface PlaybackState {
     data object Idle : PlaybackState
@@ -62,10 +65,12 @@ class PlayerController(
     softDecode: Boolean,
     private val onSourceResult: (SourcePlaybackResult) -> Unit,
 ) : AnalyticsListener {
-    private val renderersFactory = DefaultRenderersFactory(context).setExtensionRendererMode(
-        if (softDecode) DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
-        else DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON,
-    )
+    private val renderersFactory = DefaultRenderersFactory(context)
+        .setEnableDecoderFallback(true)
+        .setExtensionRendererMode(
+            if (softDecode) DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
+            else DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON,
+        )
     private val loadControl = DefaultLoadControl.Builder()
         .setBufferDurationsMs(
             MIN_BUFFER_MILLIS,
@@ -76,12 +81,18 @@ class PlayerController(
         .setPrioritizeTimeOverSizeThresholds(true)
         .build()
     private val bandwidthMeter = DefaultBandwidthMeter.Builder(context).build()
+    private val livePlaybackSpeedControl = DefaultLivePlaybackSpeedControl.Builder()
+        .setTargetLiveOffsetIncrementOnRebufferMs(
+            LIVE_TARGET_OFFSET_INCREMENT_AFTER_REBUFFER_MILLIS,
+        )
+        .build()
     private val probeCoordinator = SourceProbeCoordinator()
 
     val player: ExoPlayer = ExoPlayer.Builder(context)
         .setRenderersFactory(renderersFactory)
         .setLoadControl(loadControl)
         .setBandwidthMeter(bandwidthMeter)
+        .setLivePlaybackSpeedControl(livePlaybackSpeedControl)
         .build()
         .also {
             it.playWhenReady = true
@@ -90,6 +101,8 @@ class PlayerController(
 
     private val _state = MutableStateFlow<PlaybackState>(PlaybackState.Idle)
     val state: StateFlow<PlaybackState> = _state.asStateFlow()
+    private val _sourceTestState = MutableStateFlow<SourceTestState>(SourceTestState.Idle)
+    val sourceTestState: StateFlow<SourceTestState> = _sourceTestState.asStateFlow()
 
     private var currentChannel: Channel? = null
     private var sourceIndex = 0
@@ -99,6 +112,7 @@ class PlayerController(
     private var sourceAttemptStartedAt = 0L
     private var renderedFirstFrame = false
     private var rebufferEpisodeActive = false
+    private var recoveringBehindLiveWindow = false
     private var playbackSegmentStartedAt = 0L
     private var bufferingSegmentStartedAt = 0L
     private var sessionStarted = false
@@ -117,11 +131,21 @@ class PlayerController(
     private var rebufferTimeoutJob: Job? = null
     private var recoveryJob: Job? = null
     private var sessionCheckpointJob: Job? = null
+    private var sourceTestObserveJob: Job? = null
     private var recoveryAttempt = 0
+    private var sourceTestSession: SourceTestSession? = null
+    private var suppressRememberedSourceKey: String? = null
     private val attemptLedger = PlaybackAttemptLedger()
+    private val rebufferWindowTracker = RebufferWindowTracker(
+        threshold = REPEATED_REBUFFER_THRESHOLD,
+        windowMillis = REPEATED_REBUFFER_WINDOW_MILLIS,
+    )
+    private val sourceCooldownUntil = mutableMapOf<String, Long>()
 
     fun play(channel: Channel, preferredSource: Int = 0) {
         if (released) return
+        abandonSourceTest()
+        suppressRememberedSourceKey = null
         cancelRecovery(reset = true)
         flushSessionStats()
         currentChannel = channel
@@ -137,13 +161,15 @@ class PlayerController(
             return
         }
         val preferred = preferredSource.coerceIn(channel.sources.indices)
-        beginAttemptRound(channel, preferred, forced = null)
+        beginAttemptRound(channel, preferred, forced = preferred)
         startCurrentSourceAttempt()
     }
 
     fun selectSource(index: Int) {
         val channel = currentChannel ?: return
         if (channel.sources.isEmpty()) return
+        abandonSourceTest()
+        suppressRememberedSourceKey = null
         cancelRecovery(reset = true)
         val selected = index.coerceIn(channel.sources.indices)
         flushSessionStats()
@@ -156,13 +182,20 @@ class PlayerController(
         if (channel.sources.isEmpty()) return
         cancelRecovery(reset = true)
         flushSessionStats()
-        beginAttemptRound(channel, sourceIndex.coerceIn(channel.sources.indices), forced = null)
+        val selected = sourceIndex.coerceIn(channel.sources.indices)
+        beginAttemptRound(channel, selected, forced = selected)
         startCurrentSourceAttempt()
     }
 
     fun updateChannelSnapshot(channel: Channel) {
         val previous = currentChannel ?: return
         if (previous.id != channel.id) return
+        sourceTestSession?.let { session ->
+            currentChannel = channel
+            session.channel = channel
+            activeAttempt = activeAttempt?.copy(channel = channel)
+            return
+        }
         val previousRemaining = attemptOrder.drop(attemptPosition + 1)
         val activeFingerprint = previous.sources.getOrNull(sourceIndex)
             ?.let(SourceIdentity::fingerprint)
@@ -208,6 +241,7 @@ class PlayerController(
     }
 
     fun pause() {
+        if (sourceTestSession != null) stopSourceTest()
         cancelRecovery(reset = false)
         if (!renderedFirstFrame && sourceAttemptStartedAt > 0L) {
             pausedFirstFrameRemainingMs = (FIRST_FRAME_TIMEOUT_MILLIS -
@@ -235,9 +269,13 @@ class PlayerController(
             pausedFirstFrameRemainingMs = 0L
             scheduleFirstFrameTimeout(channel, attempt.sourceIndex, attempt.token, remaining)
         } else if (_state.value is PlaybackState.Buffering) {
-            startBufferingSegment()
+            if (rebufferEpisodeActive) {
+                startBufferingSegment()
+                scheduleRebufferRecovery(attempt)
+            } else {
+                beginRebufferEpisode(attempt)
+            }
             scheduleSessionCheckpoint()
-            scheduleRebufferTimeout(channel, attempt.sourceIndex, attempt.token)
         } else if (renderedFirstFrame) {
             startPlaybackSegment()
             scheduleSessionCheckpoint()
@@ -249,6 +287,7 @@ class PlayerController(
     }
 
     fun stop() {
+        abandonSourceTest()
         cancelRecovery(reset = true)
         flushSessionStats()
         cancelTimeouts()
@@ -261,6 +300,7 @@ class PlayerController(
 
     fun release() {
         if (released) return
+        abandonSourceTest()
         cancelRecovery(reset = true)
         flushSessionStats()
         released = true
@@ -280,16 +320,227 @@ class PlayerController(
         retryFailedChannel()
     }
 
+    fun startSourceTest() {
+        val channel = currentChannel ?: return
+        if (released || channel.sources.isEmpty() || sourceTestSession != null) return
+        cancelRecovery(reset = true)
+        flushSessionStats()
+        cancelTimeouts()
+        cancelSessionCheckpoint()
+        val originalSource = channel.sources.getOrNull(sourceIndex)
+        val results = channel.sources.indices.associateWith {
+            SourceTestResult(SourceTestStatus.PENDING)
+        }.toMutableMap()
+        sourceTestSession = SourceTestSession(
+            channel = channel,
+            originalSourceKey = originalSource?.let(SourceIdentity::fingerprint),
+            originalPlayWhenReady = player.playWhenReady,
+            currentIndex = 0,
+            results = results,
+        )
+        player.playWhenReady = true
+        startTestSource(0)
+    }
+
+    fun stopSourceTest(restorePlayback: Boolean = true) {
+        val session = sourceTestSession ?: return
+        sourceTestObserveJob?.cancel()
+        sourceTestObserveJob = null
+        cancelTimeouts()
+        cancelSessionCheckpoint()
+        attemptGate.invalidate()
+        activeAttempt = null
+        player.stop()
+        session.results[session.currentIndex]
+            ?.takeIf { it.status == SourceTestStatus.TESTING }
+            ?.let { session.results[session.currentIndex] = it.copy(status = SourceTestStatus.PENDING) }
+        sourceTestSession = null
+        _sourceTestState.value = SourceTestState.Completed(
+            channelId = session.channel.id,
+            total = session.channel.sources.size,
+            results = session.results.toMap(),
+            cancelled = true,
+        )
+        if (restorePlayback) restorePlaybackAfterTest(session)
+    }
+
+    fun clearSourceTest() {
+        if (sourceTestSession != null) stopSourceTest(restorePlayback = true)
+        _sourceTestState.value = SourceTestState.Idle
+    }
+
+    private fun abandonSourceTest() {
+        sourceTestObserveJob?.cancel()
+        sourceTestObserveJob = null
+        sourceTestSession = null
+        _sourceTestState.value = SourceTestState.Idle
+    }
+
+    private fun startTestSource(index: Int) {
+        val session = sourceTestSession ?: return
+        val channel = session.channel
+        if (index !in channel.sources.indices) {
+            completeSourceTest(session)
+            return
+        }
+        cancelTimeouts()
+        cancelSessionCheckpoint()
+        sourceTestObserveJob?.cancel()
+        sourceTestObserveJob = null
+        session.currentIndex = index
+        session.fluctuated = false
+        session.startupMs = null
+        session.videoFormat = null
+        session.results[index] = SourceTestResult(SourceTestStatus.TESTING)
+        publishSourceTestState(session)
+
+        currentChannel = channel
+        sourceIndex = index
+        sourceTypeIndex = 0
+        sourceAttemptStartedAt = SystemClock.elapsedRealtime()
+        renderedFirstFrame = false
+        rebufferEpisodeActive = false
+        recoveringBehindLiveWindow = false
+        playbackSegmentStartedAt = 0L
+        bufferingSegmentStartedAt = 0L
+        sessionStarted = false
+        pausedFirstFrameRemainingMs = 0L
+        hasBandwidthSample = false
+        latestBitrateEstimate = 0L
+        actualVideoWidth = null
+        actualVideoHeight = null
+        lastPersistedFormat = null
+        val source = channel.sources[index]
+        _state.value = PlaybackState.Preparing(channel, index)
+        reportSourceResult(
+            channel = channel,
+            source = source,
+            event = SourcePlaybackEventType.ATTEMPT_STARTED,
+            updateRememberedSource = false,
+        )
+        prepareCurrentMode()
+    }
+
+    private fun finishTestFailure(event: SourcePlaybackEventType) {
+        val session = sourceTestSession ?: return
+        val index = session.currentIndex
+        val source = session.channel.sources.getOrNull(index) ?: return
+        val status = if (event == SourcePlaybackEventType.TIMEOUT) {
+            SourceTestStatus.TIMEOUT
+        } else {
+            SourceTestStatus.FAILED
+        }
+        reportSourceResult(
+            channel = session.channel,
+            source = source,
+            event = event,
+            resultSourceIndex = index,
+            updateRememberedSource = false,
+        )
+        session.results[index] = SourceTestResult(status)
+        publishSourceTestState(session)
+        startTestSource(index + 1)
+    }
+
+    private fun finishTestObservation(session: SourceTestSession, index: Int) {
+        if (sourceTestSession !== session || session.currentIndex != index) return
+        val source = session.channel.sources.getOrNull(index) ?: return
+        val format = bestAvailableVideoFormat() ?: currentVideoFormat() ?: session.videoFormat
+        val bitrate = latestBitrateEstimate.takeIf {
+            hasBandwidthSample && it > 0L && it != C.RATE_UNSET.toLong()
+        }
+        val status = if (session.fluctuated) {
+            SourceTestStatus.FLUCTUATING
+        } else {
+            SourceTestStatus.AVAILABLE
+        }
+        reportSourceResult(
+            channel = session.channel,
+            source = source,
+            event = SourcePlaybackEventType.SUCCESS,
+            startupMs = session.startupMs,
+            bitrateBps = bitrate,
+            videoFormat = format,
+            resultSourceIndex = index,
+            updateRememberedSource = false,
+        )
+        session.results[index] = SourceTestResult(
+            status = status,
+            startupMs = session.startupMs,
+            bitrateBps = bitrate,
+            videoWidth = format?.width,
+            videoHeight = format?.height,
+            videoFrameRate = format?.frameRate,
+            videoCodec = format?.codec.orEmpty(),
+        )
+        publishSourceTestState(session)
+        startTestSource(index + 1)
+    }
+
+    private fun completeSourceTest(session: SourceTestSession) {
+        sourceTestObserveJob?.cancel()
+        sourceTestObserveJob = null
+        cancelTimeouts()
+        attemptGate.invalidate()
+        activeAttempt = null
+        sourceTestSession = null
+        _sourceTestState.value = SourceTestState.Completed(
+            channelId = session.channel.id,
+            total = session.channel.sources.size,
+            results = session.results.toMap(),
+            cancelled = false,
+        )
+        restorePlaybackAfterTest(session)
+    }
+
+    private fun restorePlaybackAfterTest(session: SourceTestSession) {
+        val channel = currentChannel?.takeIf { it.id == session.channel.id } ?: return
+        if (channel.sources.isEmpty()) return
+        val restoredIndex = session.originalSourceKey?.let { key ->
+            channel.sources.indexOfFirst { SourceIdentity.fingerprint(it) == key }
+        }?.takeIf { it >= 0 }
+        player.playWhenReady = session.originalPlayWhenReady
+        flushSessionStats()
+        if (restoredIndex != null) {
+            suppressRememberedSourceKey = SourceIdentity.fingerprint(channel.sources[restoredIndex])
+            beginAttemptRound(channel, restoredIndex, forced = restoredIndex)
+        } else {
+            suppressRememberedSourceKey = null
+            val preferred = channel.preferredSource.coerceIn(channel.sources.indices)
+            beginAttemptRound(channel, preferred, forced = null)
+        }
+        startCurrentSourceAttempt()
+    }
+
+    private fun publishSourceTestState(session: SourceTestSession) {
+        _sourceTestState.value = SourceTestState.Running(
+            channelId = session.channel.id,
+            currentIndex = session.currentIndex,
+            total = session.channel.sources.size,
+            results = session.results.toMap(),
+        )
+    }
+
     private fun buildAttemptOrder(channel: Channel, preferred: Int, forced: Int?): List<Int> {
         val ranked = SourceSelectionPolicy.rankedIndices(
             sources = channel.sources,
             preferredIndex = preferred,
             forcedIndex = forced,
         )
+        val now = SystemClock.elapsedRealtime()
+        sourceCooldownUntil.entries.removeAll { it.value <= now }
         return ranked.sortedWith(compareBy<Int> {
-            if (it == forced) -1 else if (probeCoordinator.isHostCoolingDown(channel.sources[it])) 1 else 0
+            when {
+                it == forced -> -1
+                isSourceCoolingDown(channel.sources[it], now) ||
+                    probeCoordinator.isHostCoolingDown(channel.sources[it]) -> 1
+                else -> 0
+            }
         }.thenBy { ranked.indexOf(it) })
     }
+
+    private fun isSourceCoolingDown(source: StreamSource, now: Long): Boolean =
+        (sourceCooldownUntil[SourceIdentity.fingerprint(source)] ?: 0L) > now
 
     private fun beginAttemptRound(channel: Channel, preferred: Int, forced: Int?) {
         attemptLedger.reset()
@@ -317,6 +568,8 @@ class PlayerController(
         sourceAttemptStartedAt = SystemClock.elapsedRealtime()
         renderedFirstFrame = false
         rebufferEpisodeActive = false
+        recoveringBehindLiveWindow = false
+        rebufferWindowTracker.reset()
         playbackSegmentStartedAt = 0L
         bufferingSegmentStartedAt = 0L
         sessionStarted = false
@@ -379,6 +632,7 @@ class PlayerController(
             .setLiveConfiguration(
                 MediaItem.LiveConfiguration.Builder()
                     .setTargetOffsetMs(LIVE_TARGET_OFFSET_MILLIS)
+                    .setMaxOffsetMs(MAX_LIVE_OFFSET_MILLIS)
                     .setMinPlaybackSpeed(MIN_LIVE_PLAYBACK_SPEED)
                     .setMaxPlaybackSpeed(MAX_LIVE_PLAYBACK_SPEED)
                     .build(),
@@ -414,8 +668,14 @@ class PlayerController(
     }
 
     private fun finishSourceFailure(event: SourcePlaybackEventType, message: String) {
+        if (sourceTestSession != null) {
+            finishTestFailure(event)
+            return
+        }
         val channel = currentChannel ?: return
         val source = channel.sources[sourceIndex]
+        val sourceKey = SourceIdentity.fingerprint(source)
+        if (suppressRememberedSourceKey == sourceKey) suppressRememberedSourceKey = null
         flushSessionStats()
         reportSourceResult(channel, source, event)
         promoteBestProbedCandidate(channel)
@@ -431,12 +691,19 @@ class PlayerController(
     private fun promoteBestProbedCandidate(channel: Channel) {
         val remaining = attemptOrder.drop(attemptPosition + 1)
         if (remaining.isEmpty()) return
-        val best = probeCoordinator.bestSuccessfulCandidate(channel, remaining)
-        val healthyHostsFirst = remaining
-            .filterNot { it == best }
-            .sortedBy { if (probeCoordinator.isHostCoolingDown(channel.sources[it])) 1 else 0 }
+        val now = SystemClock.elapsedRealtime()
+        val bestBand = ProbePromotionPolicy.candidatesInBestBand(
+            sources = channel.sources,
+            indices = remaining,
+            preferredIndex = channel.preferredSource,
+        ) { index ->
+            isSourceCoolingDown(channel.sources[index], now) ||
+                probeCoordinator.isHostCoolingDown(channel.sources[index])
+        }
+        val best = probeCoordinator.bestSuccessfulCandidate(channel, bestBand) ?: return
+        val healthyHostsFirst = remaining.filterNot { it == best }
         attemptOrder = attemptOrder.take(attemptPosition + 1) +
-            listOfNotNull(best) + healthyHostsFirst
+            listOf(best) + healthyHostsFirst
     }
 
     private fun scheduleCandidateProbes(channel: Channel) {
@@ -481,7 +748,8 @@ class PlayerController(
     private fun retryFailedChannel() {
         val channel = currentChannel ?: return
         if (channel.sources.isEmpty() || released) return
-        beginAttemptRound(channel, channel.preferredSource, forced = null)
+        val preferred = channel.preferredSource.coerceIn(channel.sources.indices)
+        beginAttemptRound(channel, preferred, forced = preferred)
         startCurrentSourceAttempt()
     }
 
@@ -502,6 +770,7 @@ class PlayerController(
         playbackMs: Long = 0L,
         bufferingMs: Long = 0L,
         sessionIncrement: Int = 0,
+        updateRememberedSource: Boolean = true,
     ) {
         onSourceResult(
             SourcePlaybackResult(
@@ -520,6 +789,7 @@ class PlayerController(
                 playbackMs = playbackMs,
                 bufferingMs = bufferingMs,
                 sessionIncrement = sessionIncrement,
+                updateRememberedSource = updateRememberedSource,
             ),
         )
     }
@@ -592,39 +862,111 @@ class PlayerController(
         probeCoordinator.cancelActive()
     }
 
+    private fun beginRebufferEpisode(attempt: PlaybackAttempt) {
+        if (!renderedFirstFrame || !player.playWhenReady || rebufferEpisodeActive) return
+        sourceTestSession?.let { session ->
+            if (!session.fluctuated) {
+                session.fluctuated = true
+                val previous = session.results[attempt.sourceIndex]
+                    ?: SourceTestResult(SourceTestStatus.TESTING)
+                session.results[attempt.sourceIndex] = previous.copy(
+                    status = SourceTestStatus.FLUCTUATING,
+                )
+                reportSourceResult(
+                    channel = attempt.channel,
+                    source = attempt.channel.sources[attempt.sourceIndex],
+                    event = SourcePlaybackEventType.FLUCTUATION,
+                    resultSourceIndex = attempt.sourceIndex,
+                    updateRememberedSource = false,
+                )
+                publishSourceTestState(session)
+            }
+            return
+        }
+        val channel = attempt.channel
+        flushSessionStats()
+        startBufferingSegment()
+        rebufferEpisodeActive = true
+        reportSourceResult(
+            channel,
+            channel.sources[attempt.sourceIndex],
+            SourcePlaybackEventType.FLUCTUATION,
+            resultSourceIndex = attempt.sourceIndex,
+        )
+        if (scheduleRepeatedRebufferSwitch(attempt)) return
+        scheduleRebufferRecovery(attempt)
+    }
+
+    private fun scheduleRepeatedRebufferSwitch(attempt: PlaybackAttempt): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (!rebufferWindowTracker.record(now)) return false
+
+        val channel = attempt.channel
+        val currentSource = channel.sources.getOrNull(attempt.sourceIndex) ?: return false
+        sourceCooldownUntil[SourceIdentity.fingerprint(currentSource)] =
+            now + UNSTABLE_SOURCE_COOLDOWN_MILLIS
+        val remaining = buildAttemptOrder(channel, channel.preferredSource, forced = null)
+            .filter { index ->
+                index != attempt.sourceIndex &&
+                    !attemptLedger.hasAttempted(channel.sources[index])
+            }
+        if (remaining.isEmpty()) {
+            sourceCooldownUntil.remove(SourceIdentity.fingerprint(currentSource))
+            return false
+        }
+        attemptOrder = listOf(attempt.sourceIndex) + remaining
+        attemptPosition = 0
+        promoteBestProbedCandidate(channel)
+        scope.launch {
+            yield()
+            if (!released && attemptGate.isCurrent(attempt.token) && rebufferEpisodeActive &&
+                currentChannel?.id == channel.id && sourceIndex == attempt.sourceIndex
+            ) {
+                flushSessionStats()
+                cancelTimeouts()
+                cancelSessionCheckpoint()
+                attemptPosition++
+                startCurrentSourceAttempt()
+            }
+        }
+        return true
+    }
+
+    private fun scheduleRebufferRecovery(attempt: PlaybackAttempt) {
+        val channel = attempt.channel
+        scheduleRebufferTimeout(channel, attempt.sourceIndex, attempt.token)
+        probeCoordinator.schedule(
+            channel = channel,
+            currentSourceIndex = attempt.sourceIndex,
+            orderedCandidates = attemptOrder.drop(attemptPosition + 1),
+            delayMillis = REBUFFER_PROBE_TRIGGER_MILLIS,
+            candidateLimit = REBUFFER_PROBE_CANDIDATE_LIMIT,
+        )
+    }
+
     override fun onPlaybackStateChanged(eventTime: AnalyticsListener.EventTime, playbackState: Int) {
         val attempt = activeAttemptFor(eventTime) ?: return
         val channel = attempt.channel
         when (playbackState) {
             Player.STATE_BUFFERING -> {
                 _state.value = PlaybackState.Buffering(channel, attempt.sourceIndex)
-                if (renderedFirstFrame && player.playWhenReady && !rebufferEpisodeActive) {
-                    flushSessionStats()
-                    startBufferingSegment()
-                    rebufferEpisodeActive = true
-                    reportSourceResult(
-                        channel,
-                        channel.sources[attempt.sourceIndex],
-                        SourcePlaybackEventType.FLUCTUATION,
-                        resultSourceIndex = attempt.sourceIndex,
-                    )
-                    scheduleRebufferTimeout(channel, attempt.sourceIndex, attempt.token)
-                    probeCoordinator.schedule(
-                        channel = channel,
-                        currentSourceIndex = attempt.sourceIndex,
-                        orderedCandidates = attemptOrder.drop(attemptPosition + 1),
-                        delayMillis = PROBE_TRIGGER_MILLIS,
-                    )
-                }
+                beginRebufferEpisode(attempt)
             }
-            Player.STATE_READY -> if (renderedFirstFrame && player.playWhenReady) {
-                flushSessionStats()
-                startPlaybackSegment()
-                rebufferEpisodeActive = false
-                rebufferTimeoutJob?.cancel()
-                rebufferTimeoutJob = null
-                probeCoordinator.cancelActive()
-                _state.value = PlaybackState.Playing(channel, attempt.sourceIndex)
+            Player.STATE_READY -> {
+                recoveringBehindLiveWindow = false
+                if (sourceTestSession != null) {
+                    _state.value = PlaybackState.Playing(channel, attempt.sourceIndex)
+                    return
+                }
+                if (renderedFirstFrame) {
+                    flushSessionStats()
+                    rebufferEpisodeActive = false
+                    rebufferTimeoutJob?.cancel()
+                    rebufferTimeoutJob = null
+                    probeCoordinator.cancelActive()
+                    _state.value = PlaybackState.Playing(channel, attempt.sourceIndex)
+                    if (player.playWhenReady) startPlaybackSegment()
+                }
             }
         }
     }
@@ -642,14 +984,40 @@ class PlayerController(
         cancelRecovery(reset = true)
         sessionStarted = true
         rebufferEpisodeActive = false
+        recoveringBehindLiveWindow = false
         cancelTimeouts()
         val startupMs = (SystemClock.elapsedRealtime() - sourceAttemptStartedAt).coerceAtLeast(0L)
         val bitrate = latestBitrateEstimate.takeIf {
             hasBandwidthSample && it > 0L && it != C.RATE_UNSET.toLong()
         }
-        val videoFormat = currentVideoFormat()
+        val videoFormat = bestAvailableVideoFormat() ?: currentVideoFormat()
         lastPersistedFormat = videoFormat
         _state.value = PlaybackState.Playing(channel, sourceIndex)
+        sourceTestSession?.let { session ->
+            sessionStarted = false
+            session.startupMs = startupMs
+            session.videoFormat = videoFormat
+            session.results[attempt.sourceIndex] = SourceTestResult(
+                status = if (session.fluctuated) {
+                    SourceTestStatus.FLUCTUATING
+                } else {
+                    SourceTestStatus.TESTING
+                },
+                startupMs = startupMs,
+                bitrateBps = bitrate,
+                videoWidth = videoFormat?.width,
+                videoHeight = videoFormat?.height,
+                videoFrameRate = videoFormat?.frameRate,
+                videoCodec = videoFormat?.codec.orEmpty(),
+            )
+            publishSourceTestState(session)
+            sourceTestObserveJob?.cancel()
+            sourceTestObserveJob = scope.launch {
+                delay(SOURCE_TEST_OBSERVE_MILLIS)
+                finishTestObservation(session, attempt.sourceIndex)
+            }
+            return
+        }
         reportSourceResult(
             channel = channel,
             source = source,
@@ -667,7 +1035,9 @@ class PlayerController(
             bitrateBps = bitrate,
             videoFormat = videoFormat,
             resultSourceIndex = attempt.sourceIndex,
+            updateRememberedSource = suppressRememberedSourceKey != SourceIdentity.fingerprint(source),
         )
+        suppressRememberedSourceKey = null
     }
 
     override fun onVideoSizeChanged(eventTime: AnalyticsListener.EventTime, videoSize: VideoSize) {
@@ -684,9 +1054,10 @@ class PlayerController(
 
     private fun persistVideoFormatIfChanged() {
         if (!renderedFirstFrame) return
+        if (sourceTestSession != null) return
         val channel = currentChannel ?: return
         val source = channel.sources.getOrNull(sourceIndex) ?: return
-        val format = currentVideoFormat() ?: return
+        val format = bestAvailableVideoFormat() ?: currentVideoFormat() ?: return
         if (format == lastPersistedFormat) return
         lastPersistedFormat = format
         reportSourceResult(
@@ -702,6 +1073,33 @@ class PlayerController(
         val width = actualVideoWidth ?: format.width.takeIf { it > 0 }
         val height = actualVideoHeight ?: format.height.takeIf { it > 0 }
         if (width == null || height == null) return null
+        return videoFormatSnapshot(format, width, height)
+    }
+
+    private fun bestAvailableVideoFormat(): VideoFormatSnapshot? =
+        player.currentTracks.groups.asSequence()
+            .filter { it.type == C.TRACK_TYPE_VIDEO }
+            .flatMap { group ->
+                (0 until group.length).asSequence()
+                    .filter { index -> group.isTrackSupported(index) }
+                    .map { index -> group.getTrackFormat(index) }
+            }
+            .mapNotNull { format ->
+                val width = format.width.takeIf { it > 0 } ?: return@mapNotNull null
+                val height = format.height.takeIf { it > 0 } ?: return@mapNotNull null
+                videoFormatSnapshot(format, width, height)
+            }
+            .maxWithOrNull(
+                compareBy<VideoFormatSnapshot> { it.width.toLong() * it.height }
+                    .thenBy { it.frameRate ?: 0f }
+                    .thenBy { it.trackBitrate ?: 0L },
+            )
+
+    private fun videoFormatSnapshot(
+        format: Format,
+        width: Int,
+        height: Int,
+    ): VideoFormatSnapshot {
         return VideoFormatSnapshot(
             width = width,
             height = height,
@@ -723,9 +1121,18 @@ class PlayerController(
     }
 
     override fun onPlayerError(eventTime: AnalyticsListener.EventTime, error: PlaybackException) {
-        if (activeAttemptFor(eventTime) == null) return
+        val attempt = activeAttemptFor(eventTime) ?: return
+        if (renderedFirstFrame &&
+            error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW &&
+            recoverBehindLiveWindow(attempt)
+        ) {
+            return
+        }
         if (renderedFirstFrame) {
-            finishSourceFailure(SourcePlaybackEventType.ERROR, error.errorCodeName)
+            finishSourceFailure(
+                SourcePlaybackEventType.ERROR,
+                PlaybackErrorText.from(error.errorCode),
+            )
             return
         }
         val channel = currentChannel ?: return
@@ -735,8 +1142,24 @@ class PlayerController(
             sourceTypeIndex++
             prepareCurrentMode()
         } else {
-            finishSourceFailure(SourcePlaybackEventType.ERROR, error.errorCodeName)
+            finishSourceFailure(
+                SourcePlaybackEventType.ERROR,
+                PlaybackErrorText.from(error.errorCode),
+            )
         }
+    }
+
+    private fun recoverBehindLiveWindow(attempt: PlaybackAttempt): Boolean {
+        if (recoveringBehindLiveWindow) return false
+        val source = attempt.channel.sources.getOrNull(attempt.sourceIndex) ?: return false
+        val mode = sourceModes(source).getOrNull(sourceTypeIndex)
+        if (mode != SourceMode.HLS && mode != SourceMode.DASH) return false
+        recoveringBehindLiveWindow = true
+        _state.value = PlaybackState.Buffering(attempt.channel, attempt.sourceIndex)
+        beginRebufferEpisode(attempt)
+        player.seekToDefaultPosition()
+        player.prepare()
+        return true
     }
 
     override fun onBandwidthEstimate(
@@ -808,16 +1231,36 @@ class PlayerController(
         val sourceIndex: Int,
     )
 
+    private data class SourceTestSession(
+        var channel: Channel,
+        val originalSourceKey: String?,
+        val originalPlayWhenReady: Boolean,
+        var currentIndex: Int,
+        val results: MutableMap<Int, SourceTestResult>,
+        var fluctuated: Boolean = false,
+        var startupMs: Long? = null,
+        var videoFormat: VideoFormatSnapshot? = null,
+    )
+
     private companion object {
         const val FIRST_FRAME_TIMEOUT_MILLIS = 5_000L
+        const val SOURCE_TEST_OBSERVE_MILLIS = 2_000L
         const val REBUFFER_TIMEOUT_MILLIS = 8_000L
         const val PROBE_TRIGGER_MILLIS = 2_000L
+        const val REBUFFER_PROBE_TRIGGER_MILLIS = 4_000L
+        const val REBUFFER_PROBE_CANDIDATE_LIMIT = 1
+        const val REPEATED_REBUFFER_THRESHOLD = 3
+        const val REPEATED_REBUFFER_WINDOW_MILLIS = 2L * 60 * 1_000
+        const val UNSTABLE_SOURCE_COOLDOWN_MILLIS = 5L * 60 * 1_000
         const val SESSION_CHECKPOINT_MILLIS = 5L * 60 * 1_000
         const val MIN_BUFFER_MILLIS = 8_000
         const val MAX_BUFFER_MILLIS = 30_000
+        // 首次播放保持快速出画；发生卡顿后多积累一些内容再恢复，降低连续卡顿概率。
         const val BUFFER_FOR_PLAYBACK_MILLIS = 1_000
-        const val BUFFER_AFTER_REBUFFER_MILLIS = 2_500
+        const val BUFFER_AFTER_REBUFFER_MILLIS = 5_000
         const val LIVE_TARGET_OFFSET_MILLIS = 3_000L
+        const val MAX_LIVE_OFFSET_MILLIS = 8_000L
+        const val LIVE_TARGET_OFFSET_INCREMENT_AFTER_REBUFFER_MILLIS = 2_000L
         const val MIN_LIVE_PLAYBACK_SPEED = 0.97f
         const val MAX_LIVE_PLAYBACK_SPEED = 1.05f
         const val ATTEMPT_MEDIA_ID_PREFIX = "you-tv-attempt:"

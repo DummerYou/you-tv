@@ -2,7 +2,8 @@ package com.youtv.app.domain.model
 
 data class SourceRank(
     val healthTier: Int,
-    val resolutionTier: Int,
+    val stabilityTier: Int,
+    val resolutionPixelsRank: Long,
     val stabilityScore: Double,
     val errorCount: Int,
     val frameRateRank: Float,
@@ -37,7 +38,8 @@ object SourceSelectionPolicy {
                 SourceHealthStatus.UNKNOWN -> 1
                 SourceHealthStatus.TIMEOUT, SourceHealthStatus.ERROR -> 2
             },
-            resolutionTier = resolutionTier(source, quality.healthStatus),
+            stabilityTier = stabilityTier(source),
+            resolutionPixelsRank = resolutionPixelsRank(source),
             stabilityScore = stabilityScore(source),
             errorCount = quality.errorCount,
             frameRateRank = -(source.videoFrameRate ?: 0f),
@@ -54,22 +56,31 @@ object SourceSelectionPolicy {
 
     private fun comparator(ranks: Map<Int, SourceRank>): Comparator<Int> =
         compareBy<Int> { ranks.getValue(it).healthTier }
-            .thenBy { ranks.getValue(it).resolutionTier }
-            .thenBy { ranks.getValue(it).stabilityScore }
-            .thenBy { ranks.getValue(it).errorCount }
+            .thenBy { ranks.getValue(it).stabilityTier }
+            .thenBy { ranks.getValue(it).resolutionPixelsRank }
             .thenBy { ranks.getValue(it).frameRateRank }
             .thenBy { ranks.getValue(it).startupMs }
             .thenBy { ranks.getValue(it).bitrateRank }
+            .thenBy { ranks.getValue(it).stabilityScore }
+            .thenBy { ranks.getValue(it).errorCount }
             .thenBy { ranks.getValue(it).preferredRank }
             .thenBy { ranks.getValue(it).originalOrder }
 
-    private fun resolutionTier(source: StreamSource, status: SourceHealthStatus): Int {
-        if (status != SourceHealthStatus.SUCCESS) return 0
-        val height = source.videoHeight ?: return 2
+    private fun stabilityTier(source: StreamSource): Int {
+        val score = stabilityScore(source)
         return when {
-            height >= 1080 -> 0
-            height >= 720 -> 1
+            score <= EXCELLENT_STABILITY_SCORE -> 0
+            score <= ACCEPTABLE_STABILITY_SCORE -> 1
             else -> 2
         }
     }
+
+    private fun resolutionPixelsRank(source: StreamSource): Long {
+        val width = source.videoWidth?.takeIf { it > 0 } ?: return Long.MAX_VALUE
+        val height = source.videoHeight?.takeIf { it > 0 } ?: return Long.MAX_VALUE
+        return -(width.toLong() * height.toLong())
+    }
+
+    private const val EXCELLENT_STABILITY_SCORE = 0.01
+    private const val ACCEPTABLE_STABILITY_SCORE = 0.03
 }

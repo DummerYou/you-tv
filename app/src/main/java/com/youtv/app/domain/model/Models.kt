@@ -66,6 +66,7 @@ data class SourcePlaybackResult(
     val playbackMs: Long = 0L,
     val bufferingMs: Long = 0L,
     val sessionIncrement: Int = 0,
+    val updateRememberedSource: Boolean = true,
     val checkedAt: Long = System.currentTimeMillis(),
 )
 

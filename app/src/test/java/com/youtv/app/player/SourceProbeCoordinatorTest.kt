@@ -90,6 +90,50 @@ class SourceProbeCoordinatorTest {
         }
     }
 
+    @Test
+    fun candidateLimitRestrictsConcurrentProbes() {
+        val firstHits = AtomicInteger()
+        val secondHits = AtomicInteger()
+        TestHttpServer().use { firstServer ->
+            TestHttpServer().use { secondServer ->
+                firstServer.respond("/first") {
+                    firstHits.incrementAndGet()
+                    ByteArray(4096) { 0x47 }
+                }
+                secondServer.respond("/second") {
+                    secondHits.incrementAndGet()
+                    ByteArray(4096) { 0x47 }
+                }
+                val channel = Channel(
+                    id = "limited",
+                    name = "limited",
+                    sources = listOf(
+                        StreamSource("http://127.0.0.1:1/current"),
+                        StreamSource("http://127.0.0.1:${firstServer.port}/first"),
+                        StreamSource("http://localhost:${secondServer.port}/second"),
+                    ),
+                )
+                val coordinator = SourceProbeCoordinator()
+                try {
+                    coordinator.schedule(
+                        channel = channel,
+                        currentSourceIndex = 0,
+                        orderedCandidates = listOf(1, 2),
+                        delayMillis = 0,
+                        candidateLimit = 1,
+                    )
+                    assertTrue(waitUntil {
+                        coordinator.bestSuccessfulCandidate(channel, listOf(1, 2)) == 1
+                    })
+                    assertEquals(1, firstHits.get())
+                    assertEquals(0, secondHits.get())
+                } finally {
+                    coordinator.release()
+                }
+            }
+        }
+    }
+
     private fun channelFor(server: TestHttpServer, path: String): Channel = Channel(
         id = "test",
         name = "test",
