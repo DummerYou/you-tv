@@ -50,7 +50,7 @@ class Migration2To3Test {
         }
 
         val database = Room.databaseBuilder(context, AppDatabase::class.java, TEST_DATABASE)
-            .addMigrations(AppDatabase.MIGRATION_2_3)
+            .addMigrations(AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
             .allowMainThreadQueries()
             .build()
         try {
@@ -62,10 +62,43 @@ class Migration2To3Test {
             assertEquals(0L, quality.totalPlaybackMs)
             assertEquals(1000L, quality.formatCheckedAt)
             assertTrue(runBlocking { database.channelDao().blockedSourcesSnapshot() }.isEmpty())
+            assertTrue(runBlocking { database.channelDao().playbackLogs(10) }.isEmpty())
         } finally {
             database.close()
         }
     }
+
+    @Test
+    fun playbackLogsAreOrderedAndPruned() {
+        createVersion2Database().use { it.writableDatabase }
+        val database = Room.databaseBuilder(context, AppDatabase::class.java, TEST_DATABASE)
+            .addMigrations(AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            runBlocking {
+                val dao = database.channelDao()
+                dao.insertPlaybackLogAndPrune(log(50L), cutoff = 100L, maxRows = 2)
+                dao.insertPlaybackLogAndPrune(log(200L), cutoff = 100L, maxRows = 2)
+                dao.insertPlaybackLogAndPrune(log(300L), cutoff = 100L, maxRows = 2)
+
+                assertEquals(listOf(300L, 200L), dao.playbackLogs(10).map { it.occurredAt })
+            }
+        } finally {
+            database.close()
+        }
+    }
+
+    private fun log(occurredAt: Long) = PlaybackLogEntity(
+        occurredAt = occurredAt,
+        event = "ERROR",
+        channelId = "cctv1",
+        channelName = "CCTV-1",
+        sourceNumber = 1,
+        sourceUrl = "http://test/live",
+        reasonCode = "player_error",
+        reason = "播放失败",
+    )
 
     private fun createVersion2Database(): SupportSQLiteOpenHelper {
         val configuration = SupportSQLiteOpenHelper.Configuration.builder(context)

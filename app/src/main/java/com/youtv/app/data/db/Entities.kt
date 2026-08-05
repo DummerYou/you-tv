@@ -108,7 +108,33 @@ data class BlockedSourceEntity(
     val channelId: String,
     val channelName: String,
     val sourceNumber: Int,
+    val sourceUrl: String = "",
     val videoWidth: Int? = null,
     val videoHeight: Int? = null,
     val blockedAt: Long,
+)
+
+@Entity(
+    tableName = "playback_logs",
+    indices = [Index("occurredAt")],
+)
+data class PlaybackLogEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0L,
+    val occurredAt: Long,
+    val event: String,
+    val channelId: String,
+    val channelName: String,
+    val sourceNumber: Int,
+    val sourceUrl: String,
+    val reasonCode: String,
+    val reason: String,
+    val errorCode: Int? = null,
+    val startupMs: Long? = null,
+    val playbackMs: Long = 0L,
+    val bufferingMs: Long = 0L,
+    val videoWidth: Int? = null,
+    val videoHeight: Int? = null,
+    val videoFrameRate: Float? = null,
+    val videoCodec: String = "",
+    val videoTrackBitrate: Long? = null,
 )

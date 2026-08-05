@@ -122,6 +122,11 @@ class ComposeMainActivity : ComponentActivity() {
             onEpg = viewModel::setEpgUrl,
             onDefaultChannel = viewModel::setDefaultChannel,
             onPreference = viewModel::setPreference,
+            playbackLogsProvider = { limit ->
+                runBlocking {
+                    (application as YouTvApplication).container.channelRepository.playbackLogs(limit)
+                }
+            },
         )
         if (runCatching { server.start() }.isFailure) return
         remoteServer = server

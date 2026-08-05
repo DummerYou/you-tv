@@ -6,12 +6,14 @@ import com.youtv.app.data.db.ChannelDao
 import com.youtv.app.data.db.ChannelEntity
 import com.youtv.app.data.db.ChannelGroupEntity
 import com.youtv.app.data.db.BlockedSourceEntity
+import com.youtv.app.data.db.PlaybackLogEntity
 import com.youtv.app.data.db.SourceQualityEntity
 import com.youtv.app.data.db.StreamSourceEntity
 import com.youtv.app.domain.model.BlockedSource
 import com.youtv.app.domain.model.Channel
 import com.youtv.app.domain.model.ChannelGroup
 import com.youtv.app.domain.model.ImportReport
+import com.youtv.app.domain.model.PlaybackLog
 import com.youtv.app.domain.model.SourceAddressType
 import com.youtv.app.domain.model.SourceHealthStatus
 import com.youtv.app.domain.model.SourcePlaybackResult
@@ -194,26 +196,81 @@ class ChannelRepository(
     suspend fun setFavorite(channelId: String, favorite: Boolean) = dao.setFavorite(channelId, favorite)
 
     suspend fun blockSource(channel: Channel, source: StreamSource) {
+        val now = System.currentTimeMillis()
+        val channelName = channel.title.ifBlank { channel.name }
         dao.insertBlockedSource(
             BlockedSourceEntity(
                 channelKey = SourceIdentity.channelKey(channel.name),
                 sourceFingerprint = SourceIdentity.fingerprint(source),
                 channelId = channel.id,
-                channelName = channel.title.ifBlank { channel.name },
+                channelName = channelName,
                 sourceNumber = source.order + 1,
+                sourceUrl = source.url,
                 videoWidth = source.videoWidth,
                 videoHeight = source.videoHeight,
-                blockedAt = System.currentTimeMillis(),
+                blockedAt = now,
+            ),
+        )
+        insertPlaybackLog(
+            PlaybackLogEntity(
+                occurredAt = now,
+                event = "MANUAL_BLOCK",
+                channelId = channel.id,
+                channelName = channelName,
+                sourceNumber = source.order + 1,
+                sourceUrl = source.url,
+                reasonCode = "manual_block",
+                reason = "用户手动屏蔽播放源",
+                videoWidth = source.videoWidth,
+                videoHeight = source.videoHeight,
             ),
         )
     }
 
-    suspend fun restoreBlockedSource(source: BlockedSource) =
+    suspend fun restoreBlockedSource(source: BlockedSource) {
         dao.deleteBlockedSource(source.channelKey, source.sourceFingerprint)
+        insertPlaybackLog(
+            PlaybackLogEntity(
+                occurredAt = System.currentTimeMillis(),
+                event = "MANUAL_RESTORE",
+                channelId = source.channelId,
+                channelName = source.channelName,
+                sourceNumber = source.sourceNumber,
+                sourceUrl = source.sourceUrl,
+                reasonCode = "manual_restore",
+                reason = "用户恢复已屏蔽播放源",
+                videoWidth = source.videoWidth,
+                videoHeight = source.videoHeight,
+            ),
+        )
+    }
 
-    suspend fun clearBlockedSources() = dao.clearBlockedSources()
+    suspend fun clearBlockedSources() {
+        val blocked = dao.blockedSourcesSnapshot()
+        dao.clearBlockedSources()
+        blocked.forEach { source ->
+            insertPlaybackLog(
+                PlaybackLogEntity(
+                    occurredAt = System.currentTimeMillis(),
+                    event = "MANUAL_RESTORE",
+                    channelId = source.channelId,
+                    channelName = source.channelName,
+                    sourceNumber = source.sourceNumber,
+                    sourceUrl = source.sourceUrl,
+                    reasonCode = "manual_restore_all",
+                    reason = "用户恢复全部已屏蔽播放源",
+                    videoWidth = source.videoWidth,
+                    videoHeight = source.videoHeight,
+                ),
+            )
+        }
+    }
+
+    suspend fun playbackLogs(limit: Int = PLAYBACK_LOG_MAX_ROWS): List<PlaybackLog> =
+        dao.playbackLogs(limit.coerceIn(1, PLAYBACK_LOG_MAX_ROWS)).map { it.toModel() }
 
     suspend fun rememberSourceResult(result: SourcePlaybackResult) {
+        recordPlaybackLog(result)
         dao.migrateLegacyQualityKey(result.channelId, result.sourceUrl, result.sourceKey)
         dao.insertQualityIfMissing(
             SourceQualityEntity(
@@ -261,6 +318,7 @@ class ChannelRepository(
             )
             return
         }
+        if (result.event == SourcePlaybackEventType.AUTO_SWITCH) return
         val status = when (result.event) {
             SourcePlaybackEventType.SUCCESS -> SourceHealthStatus.SUCCESS
             SourcePlaybackEventType.TIMEOUT -> SourceHealthStatus.TIMEOUT
@@ -269,6 +327,7 @@ class ChannelRepository(
             SourcePlaybackEventType.FLUCTUATION -> error("handled above")
             SourcePlaybackEventType.FORMAT_CHANGED -> error("handled above")
             SourcePlaybackEventType.SESSION_STATS -> error("handled above")
+            SourcePlaybackEventType.AUTO_SWITCH -> error("handled above")
         }
         dao.setSourceHealth(
             channelId = result.channelId,
@@ -287,6 +346,63 @@ class ChannelRepository(
         if (status == SourceHealthStatus.SUCCESS && result.updateRememberedSource) {
             dao.setLastSuccessfulSource(result.channelId, result.sourceIndex, result.sourceKey)
         }
+    }
+
+    private suspend fun recordPlaybackLog(result: SourcePlaybackResult) {
+        if (result.event in setOf(
+                SourcePlaybackEventType.FORMAT_CHANGED,
+                SourcePlaybackEventType.SESSION_STATS,
+            )
+        ) return
+        val event = when (result.event) {
+            SourcePlaybackEventType.ATTEMPT_STARTED -> "ATTEMPT"
+            SourcePlaybackEventType.SUCCESS -> "SUCCESS"
+            SourcePlaybackEventType.TIMEOUT -> "TIMEOUT"
+            SourcePlaybackEventType.ERROR -> "ERROR"
+            SourcePlaybackEventType.FLUCTUATION -> "BUFFERING"
+            SourcePlaybackEventType.AUTO_SWITCH -> "AUTO_SWITCH"
+            SourcePlaybackEventType.FORMAT_CHANGED,
+            SourcePlaybackEventType.SESSION_STATS -> return
+        }
+        val defaultReason = when (result.event) {
+            SourcePlaybackEventType.ATTEMPT_STARTED -> "开始尝试播放源"
+            SourcePlaybackEventType.SUCCESS -> "已渲染首个视频画面"
+            SourcePlaybackEventType.TIMEOUT -> "播放源响应超时"
+            SourcePlaybackEventType.ERROR -> "播放源不可用"
+            SourcePlaybackEventType.FLUCTUATION -> "播放发生缓冲"
+            SourcePlaybackEventType.AUTO_SWITCH -> "重复缓冲，自动切换下一源"
+            SourcePlaybackEventType.FORMAT_CHANGED,
+            SourcePlaybackEventType.SESSION_STATS -> ""
+        }
+        insertPlaybackLog(
+            PlaybackLogEntity(
+                occurredAt = result.checkedAt,
+                event = event,
+                channelId = result.channelId,
+                channelName = result.channelName,
+                sourceNumber = result.sourceIndex + 1,
+                sourceUrl = result.sourceUrl,
+                reasonCode = result.reasonCode.ifBlank { result.event.name.lowercase() },
+                reason = result.reason.ifBlank { defaultReason },
+                errorCode = result.errorCode,
+                startupMs = result.startupMs,
+                playbackMs = result.playbackMs,
+                bufferingMs = result.bufferingMs,
+                videoWidth = result.videoWidth,
+                videoHeight = result.videoHeight,
+                videoFrameRate = result.videoFrameRate,
+                videoCodec = result.videoCodec,
+                videoTrackBitrate = result.videoTrackBitrate,
+            ),
+        )
+    }
+
+    private suspend fun insertPlaybackLog(log: PlaybackLogEntity) {
+        dao.insertPlaybackLogAndPrune(
+            log = log,
+            cutoff = System.currentTimeMillis() - PLAYBACK_LOG_RETENTION_MILLIS,
+            maxRows = PLAYBACK_LOG_MAX_ROWS,
+        )
     }
 
     private fun StreamSource.withQuality(quality: SourceQualityEntity): StreamSource = copy(
@@ -318,8 +434,35 @@ class ChannelRepository(
         channelId = channelId,
         channelName = channelName,
         sourceNumber = sourceNumber,
+        sourceUrl = sourceUrl,
         videoWidth = videoWidth,
         videoHeight = videoHeight,
         blockedAt = blockedAt,
     )
+
+    private fun PlaybackLogEntity.toModel(): PlaybackLog = PlaybackLog(
+        id = id,
+        occurredAt = occurredAt,
+        event = event,
+        channelId = channelId,
+        channelName = channelName,
+        sourceNumber = sourceNumber,
+        sourceUrl = sourceUrl,
+        reasonCode = reasonCode,
+        reason = reason,
+        errorCode = errorCode,
+        startupMs = startupMs,
+        playbackMs = playbackMs,
+        bufferingMs = bufferingMs,
+        videoWidth = videoWidth,
+        videoHeight = videoHeight,
+        videoFrameRate = videoFrameRate,
+        videoCodec = videoCodec,
+        videoTrackBitrate = videoTrackBitrate,
+    )
+
+    private companion object {
+        const val PLAYBACK_LOG_MAX_ROWS = 2_000
+        const val PLAYBACK_LOG_RETENTION_MILLIS = 7L * 24 * 60 * 60 * 1_000
+    }
 }

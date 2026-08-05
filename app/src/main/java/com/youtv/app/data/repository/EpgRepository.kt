@@ -13,6 +13,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import java.io.File
+import java.io.BufferedInputStream
+import java.io.InputStream
+import java.io.OutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.zip.GZIPInputStream
 
 class EpgRepository(context: Context) {
     private val cache = File(context.filesDir, "epg.xml")
@@ -32,23 +38,21 @@ class EpgRepository(context: Context) {
                     if (!response.isSuccessful) return@use null
                     val body = response.body ?: return@use null
                     val temporary = File(cache.parentFile, "${cache.name}.download")
-                    body.byteStream().use { input ->
+                    try {
                         temporary.outputStream().use { output ->
-                            val buffer = ByteArray(32 * 1024)
-                            var total = 0L
-                            while (true) {
-                                val read = input.read(buffer)
-                                if (read < 0) break
-                                total += read
-                                require(total <= MAX_EPG_BYTES) { "EPG 文件超过大小限制" }
-                                output.write(buffer, 0, read)
-                            }
+                            EpgDownloadDecoder.copyXml(
+                                input = body.byteStream(),
+                                output = output,
+                                maxBytes = MAX_EPG_BYTES,
+                            )
                         }
+                        val parsed = temporary.inputStream().use { EpgParser().parse(it) }
+                        replaceCache(temporary)
+                        parsed
+                    } catch (error: Exception) {
+                        temporary.delete()
+                        throw error
                     }
-                    val parsed = temporary.inputStream().use { EpgParser().parse(it) }
-                    if (cache.exists()) cache.delete()
-                    check(temporary.renameTo(cache)) { "EPG 缓存替换失败" }
-                    parsed
                 }
             }.getOrNull()
             if (result != null) {
@@ -66,4 +70,52 @@ class EpgRepository(context: Context) {
     private companion object {
         const val MAX_EPG_BYTES = 64L * 1024 * 1024
     }
+
+    private fun replaceCache(temporary: File) {
+        val source = temporary.toPath()
+        val target = cache.toPath()
+        runCatching {
+            Files.move(
+                source,
+                target,
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE,
+            )
+        }.recoverCatching {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING)
+        }.getOrThrow()
+    }
+}
+
+internal object EpgDownloadDecoder {
+    fun copyXml(input: InputStream, output: OutputStream, maxBytes: Long) {
+        require(maxBytes > 0L)
+        decodedInput(input).use { decoded ->
+            val buffer = ByteArray(32 * 1024)
+            var total = 0L
+            while (true) {
+                val read = decoded.read(buffer)
+                if (read < 0) break
+                total += read
+                require(total <= maxBytes) { "EPG 文件超过大小限制" }
+                output.write(buffer, 0, read)
+            }
+        }
+    }
+
+    private fun decodedInput(input: InputStream): InputStream {
+        val buffered = BufferedInputStream(input)
+        buffered.mark(2)
+        val first = buffered.read()
+        val second = buffered.read()
+        buffered.reset()
+        return if (first == GZIP_MAGIC_FIRST && second == GZIP_MAGIC_SECOND) {
+            GZIPInputStream(buffered)
+        } else {
+            buffered
+        }
+    }
+
+    private const val GZIP_MAGIC_FIRST = 0x1f
+    private const val GZIP_MAGIC_SECOND = 0x8b
 }

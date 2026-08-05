@@ -22,6 +22,7 @@ enum class SourcePlaybackEventType {
     FLUCTUATION,
     FORMAT_CHANGED,
     SESSION_STATS,
+    AUTO_SWITCH,
 }
 
 data class StreamSource(
@@ -52,6 +53,7 @@ data class StreamSource(
 
 data class SourcePlaybackResult(
     val channelId: String,
+    val channelName: String = "",
     val sourceUrl: String,
     val sourceIndex: Int,
     val sourceKey: String = sourceUrl,
@@ -67,7 +69,31 @@ data class SourcePlaybackResult(
     val bufferingMs: Long = 0L,
     val sessionIncrement: Int = 0,
     val updateRememberedSource: Boolean = true,
+    val reasonCode: String = "",
+    val reason: String = "",
+    val errorCode: Int? = null,
     val checkedAt: Long = System.currentTimeMillis(),
+)
+
+data class PlaybackLog(
+    val id: Long,
+    val occurredAt: Long,
+    val event: String,
+    val channelId: String,
+    val channelName: String,
+    val sourceNumber: Int,
+    val sourceUrl: String,
+    val reasonCode: String,
+    val reason: String,
+    val errorCode: Int? = null,
+    val startupMs: Long? = null,
+    val playbackMs: Long = 0L,
+    val bufferingMs: Long = 0L,
+    val videoWidth: Int? = null,
+    val videoHeight: Int? = null,
+    val videoFrameRate: Float? = null,
+    val videoCodec: String = "",
+    val videoTrackBitrate: Long? = null,
 )
 
 data class Channel(

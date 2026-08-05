@@ -116,6 +116,8 @@ class PlayerController(
     private var playbackSegmentStartedAt = 0L
     private var bufferingSegmentStartedAt = 0L
     private var sessionStarted = false
+    private var attemptPlaybackMs = 0L
+    private var attemptBufferingMs = 0L
     private var pausedFirstFrameRemainingMs = 0L
     private var hasBandwidthSample = false
     private var latestBitrateEstimate = 0L
@@ -404,6 +406,8 @@ class PlayerController(
         playbackSegmentStartedAt = 0L
         bufferingSegmentStartedAt = 0L
         sessionStarted = false
+        attemptPlaybackMs = 0L
+        attemptBufferingMs = 0L
         pausedFirstFrameRemainingMs = 0L
         hasBandwidthSample = false
         latestBitrateEstimate = 0L
@@ -417,11 +421,18 @@ class PlayerController(
             source = source,
             event = SourcePlaybackEventType.ATTEMPT_STARTED,
             updateRememberedSource = false,
+            reasonCode = "attempt_started",
+            reason = "开始测试播放源",
         )
         prepareCurrentMode()
     }
 
-    private fun finishTestFailure(event: SourcePlaybackEventType) {
+    private fun finishTestFailure(
+        event: SourcePlaybackEventType,
+        reasonCode: String,
+        reason: String,
+        errorCode: Int?,
+    ) {
         val session = sourceTestSession ?: return
         val index = session.currentIndex
         val source = session.channel.sources.getOrNull(index) ?: return
@@ -436,6 +447,9 @@ class PlayerController(
             event = event,
             resultSourceIndex = index,
             updateRememberedSource = false,
+            reasonCode = reasonCode,
+            reason = reason,
+            errorCode = errorCode,
         )
         session.results[index] = SourceTestResult(status)
         publishSourceTestState(session)
@@ -463,6 +477,8 @@ class PlayerController(
             videoFormat = format,
             resultSourceIndex = index,
             updateRememberedSource = false,
+            reasonCode = "first_frame_rendered",
+            reason = "已渲染首个视频画面并完成来源测试",
         )
         session.results[index] = SourceTestResult(
             status = status,
@@ -573,6 +589,8 @@ class PlayerController(
         playbackSegmentStartedAt = 0L
         bufferingSegmentStartedAt = 0L
         sessionStarted = false
+        attemptPlaybackMs = 0L
+        attemptBufferingMs = 0L
         pausedFirstFrameRemainingMs = 0L
         hasBandwidthSample = false
         latestBitrateEstimate = 0L
@@ -584,6 +602,8 @@ class PlayerController(
             channel = channel,
             source = source,
             event = SourcePlaybackEventType.ATTEMPT_STARTED,
+            reasonCode = "attempt_started",
+            reason = "开始尝试播放源",
         )
         scheduleCandidateProbes(channel)
         prepareCurrentMode()
@@ -594,7 +614,11 @@ class PlayerController(
         val source = channel.sources[sourceIndex]
         val modes = sourceModes(source)
         if (sourceTypeIndex !in modes.indices) {
-            finishSourceFailure(SourcePlaybackEventType.ERROR, "播放格式不支持")
+            finishSourceFailure(
+                SourcePlaybackEventType.ERROR,
+                "播放格式不支持",
+                reasonCode = "unsupported_format",
+            )
             return
         }
         val remainingBudget = PlaybackTimeBudget.remaining(
@@ -603,7 +627,11 @@ class PlayerController(
             FIRST_FRAME_TIMEOUT_MILLIS,
         )
         if (remainingBudget <= 0L) {
-            finishSourceFailure(SourcePlaybackEventType.TIMEOUT, "播放源加载超时")
+            finishSourceFailure(
+                SourcePlaybackEventType.TIMEOUT,
+                "播放源加载超时",
+                reasonCode = "startup_timeout",
+            )
             return
         }
         firstFrameTimeoutJob?.cancel()
@@ -667,9 +695,14 @@ class PlayerController(
         }
     }
 
-    private fun finishSourceFailure(event: SourcePlaybackEventType, message: String) {
+    private fun finishSourceFailure(
+        event: SourcePlaybackEventType,
+        message: String,
+        reasonCode: String,
+        errorCode: Int? = null,
+    ) {
         if (sourceTestSession != null) {
-            finishTestFailure(event)
+            finishTestFailure(event, reasonCode, message, errorCode)
             return
         }
         val channel = currentChannel ?: return
@@ -677,7 +710,16 @@ class PlayerController(
         val sourceKey = SourceIdentity.fingerprint(source)
         if (suppressRememberedSourceKey == sourceKey) suppressRememberedSourceKey = null
         flushSessionStats()
-        reportSourceResult(channel, source, event)
+        reportSourceResult(
+            channel = channel,
+            source = source,
+            event = event,
+            reasonCode = reasonCode,
+            reason = message,
+            errorCode = errorCode,
+            playbackMs = attemptPlaybackMs,
+            bufferingMs = attemptBufferingMs,
+        )
         promoteBestProbedCandidate(channel)
         cancelTimeouts()
         attemptPosition++
@@ -771,10 +813,14 @@ class PlayerController(
         bufferingMs: Long = 0L,
         sessionIncrement: Int = 0,
         updateRememberedSource: Boolean = true,
+        reasonCode: String = "",
+        reason: String = "",
+        errorCode: Int? = null,
     ) {
         onSourceResult(
             SourcePlaybackResult(
                 channelId = channel.id,
+                channelName = channel.title.ifBlank { channel.name },
                 sourceUrl = source.url,
                 sourceKey = SourceIdentity.fingerprint(source),
                 sourceIndex = resultSourceIndex,
@@ -790,6 +836,9 @@ class PlayerController(
                 bufferingMs = bufferingMs,
                 sessionIncrement = sessionIncrement,
                 updateRememberedSource = updateRememberedSource,
+                reasonCode = reasonCode,
+                reason = reason,
+                errorCode = errorCode,
             ),
         )
     }
@@ -814,6 +863,8 @@ class PlayerController(
         playbackSegmentStartedAt = 0L
         bufferingSegmentStartedAt = 0L
         if (playbackMs == 0L && bufferingMs == 0L) return
+        attemptPlaybackMs += playbackMs
+        attemptBufferingMs += bufferingMs
         val channel = currentChannel ?: return
         val source = channel.sources.getOrNull(sourceIndex) ?: return
         reportSourceResult(
@@ -837,7 +888,11 @@ class PlayerController(
             if (!released && attemptGate.isCurrent(token) && !renderedFirstFrame &&
                 currentChannel?.id == channel.id && sourceIndex == scheduledSourceIndex
             ) {
-                finishSourceFailure(SourcePlaybackEventType.TIMEOUT, "播放源加载超时")
+                finishSourceFailure(
+                    SourcePlaybackEventType.TIMEOUT,
+                    "播放源加载超时",
+                    reasonCode = "startup_timeout",
+                )
             }
         }
     }
@@ -849,7 +904,11 @@ class PlayerController(
             if (!released && attemptGate.isCurrent(token) && rebufferEpisodeActive &&
                 currentChannel?.id == channel.id && sourceIndex == scheduledSourceIndex
             ) {
-                finishSourceFailure(SourcePlaybackEventType.TIMEOUT, "播放持续缓冲，已尝试下一源")
+                finishSourceFailure(
+                    SourcePlaybackEventType.TIMEOUT,
+                    "播放持续缓冲 8 秒，已尝试下一源",
+                    reasonCode = "continuous_buffering",
+                )
             }
         }
     }
@@ -878,6 +937,10 @@ class PlayerController(
                     event = SourcePlaybackEventType.FLUCTUATION,
                     resultSourceIndex = attempt.sourceIndex,
                     updateRememberedSource = false,
+                    reasonCode = "rebuffer_started",
+                    reason = "来源测试期间发生缓冲",
+                    playbackMs = attemptPlaybackMs,
+                    bufferingMs = attemptBufferingMs,
                 )
                 publishSourceTestState(session)
             }
@@ -892,6 +955,10 @@ class PlayerController(
             channel.sources[attempt.sourceIndex],
             SourcePlaybackEventType.FLUCTUATION,
             resultSourceIndex = attempt.sourceIndex,
+            reasonCode = "rebuffer_started",
+            reason = "播放发生缓冲",
+            playbackMs = attemptPlaybackMs,
+            bufferingMs = attemptBufferingMs,
         )
         if (scheduleRepeatedRebufferSwitch(attempt)) return
         scheduleRebufferRecovery(attempt)
@@ -914,6 +981,17 @@ class PlayerController(
             sourceCooldownUntil.remove(SourceIdentity.fingerprint(currentSource))
             return false
         }
+        reportSourceResult(
+            channel = channel,
+            source = currentSource,
+            event = SourcePlaybackEventType.AUTO_SWITCH,
+            resultSourceIndex = attempt.sourceIndex,
+            updateRememberedSource = false,
+            reasonCode = "repeated_rebuffer",
+            reason = "60 秒内发生 2 次缓冲，自动切换下一源",
+            playbackMs = attemptPlaybackMs,
+            bufferingMs = attemptBufferingMs,
+        )
         attemptOrder = listOf(attempt.sourceIndex) + remaining
         attemptPosition = 0
         promoteBestProbedCandidate(channel)
@@ -1036,6 +1114,8 @@ class PlayerController(
             videoFormat = videoFormat,
             resultSourceIndex = attempt.sourceIndex,
             updateRememberedSource = suppressRememberedSourceKey != SourceIdentity.fingerprint(source),
+            reasonCode = "first_frame_rendered",
+            reason = "已渲染首个视频画面",
         )
         suppressRememberedSourceKey = null
     }
@@ -1132,6 +1212,8 @@ class PlayerController(
             finishSourceFailure(
                 SourcePlaybackEventType.ERROR,
                 PlaybackErrorText.from(error.errorCode),
+                reasonCode = "player_error",
+                errorCode = error.errorCode,
             )
             return
         }
@@ -1145,6 +1227,8 @@ class PlayerController(
             finishSourceFailure(
                 SourcePlaybackEventType.ERROR,
                 PlaybackErrorText.from(error.errorCode),
+                reasonCode = "player_error",
+                errorCode = error.errorCode,
             )
         }
     }
@@ -1249,8 +1333,8 @@ class PlayerController(
         const val PROBE_TRIGGER_MILLIS = 2_000L
         const val REBUFFER_PROBE_TRIGGER_MILLIS = 4_000L
         const val REBUFFER_PROBE_CANDIDATE_LIMIT = 1
-        const val REPEATED_REBUFFER_THRESHOLD = 3
-        const val REPEATED_REBUFFER_WINDOW_MILLIS = 2L * 60 * 1_000
+        const val REPEATED_REBUFFER_THRESHOLD = 2
+        const val REPEATED_REBUFFER_WINDOW_MILLIS = 60_000L
         const val UNSTABLE_SOURCE_COOLDOWN_MILLIS = 5L * 60 * 1_000
         const val SESSION_CHECKPOINT_MILLIS = 5L * 60 * 1_000
         const val MIN_BUFFER_MILLIS = 8_000

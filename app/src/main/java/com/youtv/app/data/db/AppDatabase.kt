@@ -12,8 +12,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         StreamSourceEntity::class,
         SourceQualityEntity::class,
         BlockedSourceEntity::class,
+        PlaybackLogEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -125,6 +126,39 @@ abstract class AppDatabase : RoomDatabase() {
                 )
                 database.execSQL(
                     "CREATE INDEX IF NOT EXISTS index_blocked_sources_channelId ON blocked_sources(channelId)",
+                )
+            }
+        }
+
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    "ALTER TABLE blocked_sources ADD COLUMN sourceUrl TEXT NOT NULL DEFAULT ''",
+                )
+                database.execSQL(
+                    """CREATE TABLE IF NOT EXISTS playback_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        occurredAt INTEGER NOT NULL,
+                        event TEXT NOT NULL,
+                        channelId TEXT NOT NULL,
+                        channelName TEXT NOT NULL,
+                        sourceNumber INTEGER NOT NULL,
+                        sourceUrl TEXT NOT NULL,
+                        reasonCode TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        errorCode INTEGER,
+                        startupMs INTEGER,
+                        playbackMs INTEGER NOT NULL,
+                        bufferingMs INTEGER NOT NULL,
+                        videoWidth INTEGER,
+                        videoHeight INTEGER,
+                        videoFrameRate REAL,
+                        videoCodec TEXT NOT NULL,
+                        videoTrackBitrate INTEGER
+                    )""",
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_playback_logs_occurredAt ON playback_logs(occurredAt)",
                 )
             }
         }

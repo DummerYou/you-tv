@@ -25,6 +25,7 @@ data class BlockedSource(
     val channelId: String,
     val channelName: String,
     val sourceNumber: Int,
+    val sourceUrl: String = "",
     val videoWidth: Int? = null,
     val videoHeight: Int? = null,
     val blockedAt: Long = System.currentTimeMillis(),

@@ -37,6 +37,9 @@ interface ChannelDao {
     @Query("SELECT * FROM blocked_sources ORDER BY blockedAt DESC")
     fun observeBlockedSources(): Flow<List<BlockedSourceEntity>>
 
+    @Query("SELECT * FROM playback_logs ORDER BY occurredAt DESC, id DESC LIMIT :limit")
+    suspend fun playbackLogs(limit: Int): List<PlaybackLogEntity>
+
     @Query("SELECT COUNT(*) FROM channels")
     suspend fun channelCount(): Int
 
@@ -70,6 +73,9 @@ interface ChannelDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertBlockedSource(source: BlockedSourceEntity)
 
+    @Insert
+    suspend fun insertPlaybackLog(log: PlaybackLogEntity)
+
     @Query("DELETE FROM channel_groups")
     suspend fun clearGroups()
 
@@ -81,6 +87,23 @@ interface ChannelDao {
 
     @Query("DELETE FROM blocked_sources")
     suspend fun clearBlockedSources()
+
+    @Query("DELETE FROM playback_logs WHERE occurredAt < :cutoff")
+    suspend fun deletePlaybackLogsBefore(cutoff: Long)
+
+    @Query(
+        """DELETE FROM playback_logs WHERE id NOT IN (
+            SELECT id FROM playback_logs ORDER BY occurredAt DESC, id DESC LIMIT :maxRows
+        )""",
+    )
+    suspend fun trimPlaybackLogs(maxRows: Int)
+
+    @Transaction
+    suspend fun insertPlaybackLogAndPrune(log: PlaybackLogEntity, cutoff: Long, maxRows: Int) {
+        insertPlaybackLog(log)
+        deletePlaybackLogsBefore(cutoff)
+        trimPlaybackLogs(maxRows)
+    }
 
     @Query("UPDATE channels SET favorite = :favorite WHERE id = :channelId")
     suspend fun setFavorite(channelId: String, favorite: Boolean)

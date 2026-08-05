@@ -5,10 +5,14 @@ import com.google.gson.Gson
 import com.youtv.app.R
 import com.youtv.app.data.PlaylistTextDecoder
 import com.youtv.app.data.repository.AppSettings
+import com.youtv.app.domain.model.PlaybackLog
 import fi.iki.elonen.NanoHTTPD
 import java.io.File
 import java.net.URI
 import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class RemoteConfigServer(
     private val context: Context,
@@ -20,6 +24,7 @@ class RemoteConfigServer(
     private val onEpg: (String) -> Unit,
     private val onDefaultChannel: (Int) -> Unit,
     private val onPreference: (String, Boolean) -> Unit,
+    private val playbackLogsProvider: (Int) -> List<PlaybackLog>,
 ) : NanoHTTPD(host, PORT) {
     private val gson = Gson()
 
@@ -44,6 +49,8 @@ class RemoteConfigServer(
             "/api/epg", "/api/v1/epg" -> if (session.method == Method.POST) updateSetting(session, "epg") else methodNotAllowed()
             "/api/default-channel", "/api/v1/default-channel" -> if (session.method == Method.POST) updateDefaultChannel(session) else methodNotAllowed()
             "/api/v1/preference" -> if (session.method == Method.POST) updatePreference(session) else methodNotAllowed()
+            "/api/v1/playback-logs" -> if (session.method == Method.GET) playbackLogs(session) else methodNotAllowed()
+            "/api/v1/playback-logs/export" -> if (session.method == Method.GET) exportPlaybackLogs() else methodNotAllowed()
             else -> newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found")
         }.apply { addHeader("Cache-Control", "no-store") }
     }
@@ -119,6 +126,23 @@ class RemoteConfigServer(
         return ok()
     }
 
+    private fun playbackLogs(session: IHTTPSession): Response {
+        val limit = session.parameters["limit"]?.firstOrNull()?.toIntOrNull()
+            ?.coerceIn(1, MAX_PLAYBACK_LOG_ROWS)
+            ?: DEFAULT_PLAYBACK_LOG_LIMIT
+        return json(playbackLogsProvider(limit))
+    }
+
+    private fun exportPlaybackLogs(): Response {
+        val response = json(playbackLogsProvider(MAX_PLAYBACK_LOG_ROWS))
+        val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        response.addHeader(
+            "Content-Disposition",
+            "attachment; filename=\"you-tv-playback-logs-$timestamp.json\"",
+        )
+        return response
+    }
+
     private fun parseJsonBody(session: IHTTPSession): Map<String, Any?>? = runCatching {
         @Suppress("UNCHECKED_CAST")
         gson.fromJson(readUtf8Body(session), Map::class.java) as Map<String, Any?>
@@ -146,6 +170,11 @@ class RemoteConfigServer(
     }
 
     private fun ok() = newFixedLengthResponse(Response.Status.OK, "application/json", "{\"success\":true}")
+    private fun json(value: Any) = newFixedLengthResponse(
+        Response.Status.OK,
+        "application/json; charset=utf-8",
+        gson.toJson(value),
+    )
     private fun badRequest(message: String) = newFixedLengthResponse(
         Response.Status.BAD_REQUEST, "application/json", gson.toJson(mapOf("success" to false, "error" to message)),
     )
@@ -155,6 +184,8 @@ class RemoteConfigServer(
         const val PORT = 34567
         const val SESSION_MILLIS = 10 * 60 * 1000L
         private const val MAX_BODY_BYTES = 2L * 1024 * 1024
+        private const val DEFAULT_PLAYBACK_LOG_LIMIT = 200
+        private const val MAX_PLAYBACK_LOG_ROWS = 2_000
         private val ALLOWED_PREFERENCES = setOf(
             "channelReversal", "channelNumber", "showTime", "displaySeconds", "repeatInfo",
             "defaultFavorite", "showAllChannels", "compactMenu", "softDecode", "bootStartup",
