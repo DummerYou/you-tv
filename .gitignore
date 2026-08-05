@@ -20,6 +20,4 @@ files
 .workbuddy/
 app/release/
 .README.md
-keystore.properties
-*.keystore
 *.jks
